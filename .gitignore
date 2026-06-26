@@ -1,0 +1,10 @@
+# Python 运行环境、缓存和测试产物不纳入版本控制。
+.venv/
+backend/.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 本地运行时生成的数据与上传文件。
+*.db
+backend/uploads/
