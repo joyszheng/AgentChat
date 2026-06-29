@@ -1,6 +1,7 @@
 # Python 运行环境、缓存和测试产物不纳入版本控制。
 .venv/
 backend/.venv/
+backend/.env
 __pycache__/
 *.py[cod]
 .pytest_cache/

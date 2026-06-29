@@ -1,0 +1,11 @@
+* text=auto eol=lf
+
+# Keep binary data out of line-ending normalization.
+*.db binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary

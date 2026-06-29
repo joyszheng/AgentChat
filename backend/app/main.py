@@ -6,7 +6,7 @@ from uuid import uuid4
 
 from . import models
 from .database import engine
-from .routers import tasks
+from .routers import tasks, ai
 
 
 # 开发阶段启动时自动建表；生产环境建议改用数据库迁移工具。
@@ -31,6 +31,7 @@ app.add_middleware(
 )
 
 # 将任务相关路由注册到主应用。
+app.include_router(ai.router)
 app.include_router(tasks.router)
 
 
