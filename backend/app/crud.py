@@ -1,4 +1,5 @@
 from sqlalchemy.orm import Session
+from sqlalchemy.sql import func
 
 from . import models, schemas
 
@@ -80,3 +81,211 @@ def delete_task(db: Session, task_id: int):
     db.delete(task)
     db.commit()
     return task
+
+
+def create_uploaded_document(
+    db: Session,
+    *,
+    original_filename: str,
+    stored_filename: str,
+    content_type: str | None,
+    file_ext: str,
+    size_bytes: int,
+    saved_to: str,
+):
+    """创建上传文件记录，初始状态为 uploaded。"""
+
+    document = models.UploadedDocument(
+        original_filename=original_filename,
+        stored_filename=stored_filename,
+        content_type=content_type,
+        file_ext=file_ext,
+        size_bytes=size_bytes,
+        saved_to=saved_to,
+        status="uploaded",
+    )
+    db.add(document)
+    db.commit()
+    db.refresh(document)
+
+    return document
+
+
+def mark_uploaded_document_processing(db: Session, document_id: int):
+    """Mark an uploaded document as being processed by the background worker."""
+
+    document = get_uploaded_document(db, document_id)
+    if document is None:
+        return None
+
+    document.status = "processing"
+    document.error_message = None
+
+    db.commit()
+    db.refresh(document)
+
+    return document
+
+
+def mark_uploaded_document_indexed(
+    db: Session,
+    document_id: int,
+    *,
+    document_count: int,
+    chunk_count: int,
+    file_sha256: str | None,
+    warnings: list[str],
+):
+    """标记上传文件已成功解析并加入 RAG 索引。"""
+
+    document = get_uploaded_document(db, document_id)
+    if document is None:
+        return None
+
+    document.status = "indexed"
+    document.document_count = document_count
+    document.chunk_count = chunk_count
+    document.file_sha256 = file_sha256
+    document.warnings = warnings
+    document.error_message = None
+
+    db.commit()
+    db.refresh(document)
+
+    return document
+
+
+def mark_uploaded_document_failed(db: Session, document_id: int, *, error_message: str):
+    """标记上传文件解析或入库失败，并保存失败原因。"""
+
+    document = get_uploaded_document(db, document_id)
+    if document is None:
+        return None
+
+    document.status = "failed"
+    document.error_message = error_message
+
+    db.commit()
+    db.refresh(document)
+
+    return document
+
+
+def get_uploaded_document(db: Session, document_id: int):
+    """按 ID 查询上传文件记录。"""
+
+    return db.query(models.UploadedDocument).filter(models.UploadedDocument.id == document_id).first()
+
+
+def list_uploaded_documents(db: Session, skip: int = 0, limit: int = 20):
+    """按创建时间倒序查询上传文件记录。"""
+
+    return (
+        db.query(models.UploadedDocument)
+        .order_by(models.UploadedDocument.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
+
+
+def create_chat_session(db: Session, *, title: str | None = None, mode: str = "chat"):
+    """创建一个多轮对话会话。"""
+
+    session = models.ChatSession(title=title, mode=mode)
+    db.add(session)
+    db.commit()
+    db.refresh(session)
+
+    return session
+
+
+def get_chat_session(db: Session, session_id: int):
+    """按 ID 查询会话。"""
+
+    return db.query(models.ChatSession).filter(models.ChatSession.id == session_id).first()
+
+
+def get_or_create_chat_session(
+    db: Session,
+    *,
+    session_id: int | None = None,
+    title: str | None = None,
+    mode: str = "chat",
+):
+    """传入 session_id 时复用会话；未传入时创建新会话。"""
+
+    if session_id is not None:
+        return get_chat_session(db, session_id)
+
+    return create_chat_session(db, title=title, mode=mode)
+
+
+def list_chat_sessions(db: Session, skip: int = 0, limit: int = 20):
+    """按最近消息时间倒序查询会话列表。"""
+
+    return (
+        db.query(models.ChatSession)
+        .order_by(
+            models.ChatSession.last_message_at.desc().nullslast(),
+            models.ChatSession.created_at.desc(),
+        )
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
+
+
+def create_chat_message(
+    db: Session,
+    *,
+    session_id: int,
+    role: str,
+    content: str,
+    message_metadata: dict | None = None,
+):
+    """保存一条会话消息，并刷新会话最近消息时间。"""
+
+    message = models.ChatMessage(
+        session_id=session_id,
+        role=role,
+        content=content,
+        message_metadata=message_metadata or {},
+    )
+    db.add(message)
+
+    session = get_chat_session(db, session_id)
+    if session is not None:
+        session.last_message_at = func.now()
+
+    db.commit()
+    db.refresh(message)
+
+    return message
+
+
+def list_chat_messages(db: Session, session_id: int, skip: int = 0, limit: int = 50):
+    """按时间正序查询会话消息。"""
+
+    return (
+        db.query(models.ChatMessage)
+        .filter(models.ChatMessage.session_id == session_id)
+        .order_by(models.ChatMessage.created_at.asc(), models.ChatMessage.id.asc())
+        .offset(skip)
+        .limit(limit)
+        .all()
+    )
+
+
+def get_recent_chat_messages(db: Session, session_id: int, limit: int = 10):
+    """获取最近 N 条消息，并按时间正序返回。"""
+
+    messages = (
+        db.query(models.ChatMessage)
+        .filter(models.ChatMessage.session_id == session_id)
+        .order_by(models.ChatMessage.created_at.desc(), models.ChatMessage.id.desc())
+        .limit(limit)
+        .all()
+    )
+
+    return list(reversed(messages))

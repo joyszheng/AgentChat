@@ -9,3 +9,5 @@ __pycache__/
 # 本地运行时生成的数据与上传文件。
 *.db
 backend/uploads/
+backend/vector_store/
+backend/uvicorn.*.log

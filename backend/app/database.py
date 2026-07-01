@@ -1,14 +1,20 @@
+import os
+
+from dotenv import load_dotenv
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
 
-# 开发环境使用项目目录下的 SQLite 文件；生产环境应改为独立配置。
-DATABASE_URL = "sqlite:///./test.db"
+load_dotenv()
+
+# 优先使用 .env 中的 PostgreSQL 连接；未配置时回退到项目目录下的 SQLite 文件。
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./test.db")
+
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
 
 engine = create_engine(
     DATABASE_URL,
-    # SQLite 默认不允许跨线程访问连接，FastAPI 开发服务器需要显式放开。
-    connect_args={"check_same_thread": False}
+    connect_args=connect_args,
 )
 
 SessionLocal = sessionmaker(
