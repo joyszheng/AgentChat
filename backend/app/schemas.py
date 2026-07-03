@@ -115,3 +115,71 @@ class ChatResponse(BaseModel):
     session_id: int
     user_message_id: int
     assistant_message_id: int
+
+
+class SystemSettingBase(BaseModel):
+    """系统配置基础模型。"""
+
+    key: str = Field(min_length=1, max_length=100)
+    value: str
+    category: str = Field(min_length=1, max_length=50)
+    is_encrypted: bool = False
+    description: str | None = Field(default=None, max_length=500)
+
+
+class SystemSettingCreate(SystemSettingBase):
+    """创建或更新系统配置时使用的请求数据。"""
+    pass
+
+
+class SystemSettingResponse(BaseModel):
+    """系统配置接口返回的数据结构。"""
+
+    id: int
+    key: str
+    value: str  # 敏感配置会自动脱敏
+    category: str
+    is_encrypted: bool
+    description: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {
+        "from_attributes": True
+    }
+
+
+class SystemSettingBatchUpdate(BaseModel):
+    """批量更新系统配置。"""
+
+    settings: list[SystemSettingCreate]
+
+
+class UserLogin(BaseModel):
+    """用户登录请求。"""
+
+    username: str = Field(min_length=1, max_length=50)
+    password: str = Field(min_length=1)
+
+
+class UserResponse(BaseModel):
+    """用户信息响应。"""
+
+    id: int
+    username: str
+    email: str | None
+    role: str
+    is_active: bool
+    created_at: datetime
+
+    model_config = {
+        "from_attributes": True
+    }
+
+
+class TokenResponse(BaseModel):
+    """登录成功返回的令牌。"""
+
+    access_token: str
+    token_type: str = "bearer"
+    user: UserResponse

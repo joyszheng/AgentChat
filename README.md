@@ -12,6 +12,7 @@ AgentChat 是一个用于学习 FastAPI、SQLAlchemy 与 LangChain 的 AI 任务
 - 基于固定文档和上传文档的 RAG 问答
 - 文件上传、文本解析、清洗与 RAG 入库
 - pytest 接口与异常测试
+- 文档处理完成邮件通知
 
 ## 项目结构
 
@@ -65,9 +66,41 @@ AGENTCHAT_EMBEDDING_DIMENSIONS=1024
 # 如果 Milvus 开启鉴权，再配置：
 # AGENTCHAT_MILVUS_TOKEN=root:Milvus
 # AGENTCHAT_MILVUS_DB=default
+
+# 邮件通知配置（可选）
+SMTP_HOST=smtp.qq.com
+SMTP_PORT=465
+SMTP_USER=你的QQ邮箱地址
+SMTP_PASSWORD=你的QQ邮箱授权码
+SMTP_FROM_EMAIL=你的QQ邮箱地址
+SMTP_FROM_NAME=AgentChat通知系统
+SMTP_ENABLED=true
 ```
 
 不要将真实 API Key 或数据库密码提交到版本控制。未配置 `DATABASE_URL` 时，后端会回退使用本地 SQLite 文件 `backend/test.db`。
+
+### 邮件通知配置（可选）
+
+项目支持在文档处理完成后发送邮件通知。当前通知接收地址配置在 `backend/app/main.py` 的 `DOCUMENT_NOTIFICATION_EMAIL` 常量中。
+
+**QQ 邮箱配置步骤：**
+
+1. 登录 QQ 邮箱网页版，进入「设置」→「账户」
+2. 找到「POP3/IMAP/SMTP/Exchange/CardDAV/CalDAV服务」
+3. 开启「IMAP/SMTP服务」或「POP3/SMTP服务」
+4. 点击「生成授权码」，按提示完成验证
+5. 将生成的授权码填入 `.env` 的 `SMTP_PASSWORD` 字段
+
+**注意**：`SMTP_PASSWORD` 填写的是授权码，不是 QQ 密码。
+
+如果不需要邮件通知，可以将 `SMTP_ENABLED` 设为 `false`，或不配置 `SMTP_USER` 和 `SMTP_PASSWORD`。
+
+邮件通知内容包括：
+- 文件名和文件大小
+- 上传时间
+- 处理状态（成功/失败）
+- 文档数量和文本分片数
+- 警告信息或错误信息
 
 ## 启动服务
 

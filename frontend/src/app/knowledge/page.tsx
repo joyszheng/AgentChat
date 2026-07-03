@@ -5,6 +5,7 @@ import { Table, Upload, Button, message, Tag, Progress, Tooltip, Popconfirm } fr
 import { RefreshCwIcon, ArchiveIcon, DeleteIcon, DownloadIcon } from 'lucide-animated';
 import { useRequest } from 'ahooks';
 import http from '@/lib/http/axios';
+import { isAuthenticated } from '@/lib/auth';
 import type { UploadProps } from 'antd';
 
 const { Dragger } = Upload;
@@ -60,8 +61,9 @@ const DocumentStatusCell = ({ doc, onComplete }: { doc: any; onComplete: () => v
     eventSource.addEventListener('failed', handleFailed);
 
     eventSource.onerror = (error) => {
-      console.error(`EventSource error for doc ${doc.id}:`, error);
-      // EventSource 会自动重连，如果需要可以在此增加重试上限逻辑
+      // EventSource 在服务端关闭连接时会触发 onerror，但 readyState 可能还未更新为 CLOSED
+      // 我们依赖事件处理器中的 eventSource.close() 来正确关闭，这里不再记录正常关闭
+      // 只在长时间连接失败时用户会看到 UI 上的状态
     };
 
     return () => {
@@ -96,6 +98,20 @@ const DocumentStatusCell = ({ doc, onComplete }: { doc: any; onComplete: () => v
 
 export default function KnowledgePage() {
   const [documents, setDocuments] = useState<any[]>([]);
+  const [isMobile, setIsMobile] = useState(false);
+  const [downloadingDocs, setDownloadingDocs] = useState<Record<number, number>>({});
+  const [isLoggedIn, setIsLoggedIn] = useState(false);
+
+  useEffect(() => {
+    const handleResize = () => setIsMobile(window.innerWidth < 768);
+    handleResize();
+    window.addEventListener('resize', handleResize);
+
+    // 检查登录状态
+    setIsLoggedIn(isAuthenticated());
+
+    return () => window.removeEventListener('resize', handleResize);
+  }, []);
 
   const { run: fetchDocuments, loading } = useRequest(async () => {
     const res: any = await http.get('/documents');
@@ -115,8 +131,6 @@ export default function KnowledgePage() {
       message.error('删除失败');
     }
   };
-
-  const [downloadingDocs, setDownloadingDocs] = useState<Record<number, number>>({});
 
   const handleDownload = async (doc: any) => {
     try {
@@ -209,7 +223,7 @@ export default function KnowledgePage() {
             <Progress type="circle" percent={downloadingDocs[record.id]} size={20} showInfo={false} />
           ) : (
             <Tooltip title="下载原文件">
-              <div 
+              <div
                 className="flex items-center justify-center w-8 h-8 rounded-md hover:bg-black/5 cursor-pointer text-gray-600 transition-colors"
                 onClick={() => handleDownload(record)}
               >
@@ -217,18 +231,20 @@ export default function KnowledgePage() {
               </div>
             </Tooltip>
           )}
-          <Popconfirm
-            title="确认删除该文档吗？"
-            description="删除后不可恢复，对应的知识库向量也将被清理。"
-            onConfirm={() => deleteDocument(record.id)}
-            okText="确认"
-            cancelText="取消"
-          >
-            <div className="flex items-center justify-center px-2 py-1 rounded-md hover:bg-red-50 cursor-pointer text-red-500 transition-colors">
-              <DeleteIcon size={16} />
-              <span className="ml-1 text-sm">删除</span>
-            </div>
-          </Popconfirm>
+          {isLoggedIn && (
+            <Popconfirm
+              title="确认删除该文档吗？"
+              description="删除后不可恢复，对应的知识库向量也将被清理。"
+              onConfirm={() => deleteDocument(record.id)}
+              okText="确认"
+              cancelText="取消"
+            >
+              <div className="flex items-center justify-center px-2 py-1 rounded-md hover:bg-red-50 cursor-pointer text-red-500 transition-colors">
+                <DeleteIcon size={16} />
+                <span className="ml-1 text-sm">删除</span>
+              </div>
+            </Popconfirm>
+          )}
         </div>
       ),
     }
@@ -244,33 +260,34 @@ export default function KnowledgePage() {
               <Progress type="circle" percent={downloadingDocs[doc.id]} size={20} showInfo={false} />
             </div>
           ) : (
-            <div 
+            <div
               className="flex items-center justify-center w-6 h-6 rounded-md hover:bg-black/5 cursor-pointer text-gray-600 transition-colors"
               onClick={() => handleDownload(doc)}
             >
               <DownloadIcon size={14} />
             </div>
           )}
-          <Popconfirm
-            title="确认删除？"
-            onConfirm={() => deleteDocument(doc.id)}
-            okText="确认"
-            cancelText="取消"
-          >
-            <div className="flex items-center justify-center w-6 h-6 rounded-md hover:bg-red-50 cursor-pointer text-red-500 transition-colors">
-              <DeleteIcon size={14} />
-            </div>
-          </Popconfirm>
+          {isLoggedIn && (
+            <Popconfirm
+              title="确认删除"
+              description="删除后不可恢复"
+              onConfirm={() => deleteDocument(doc.id)}
+              okText="确认"
+              cancelText="取消"
+            >
+              <div className="flex items-center justify-center w-6 h-6 rounded-md hover:bg-red-50 cursor-pointer text-red-500 transition-colors">
+                <DeleteIcon size={14} />
+              </div>
+            </Popconfirm>
+          )}
         </div>
       </div>
-      <div className="flex justify-between items-end">
-        <div className="text-xs text-gray-400 flex flex-col gap-1">
-          <span>{doc.size_bytes ? `${(doc.size_bytes / 1024).toFixed(2)} KB` : '-'}</span>
-          <span>{doc.created_at ? new Date(doc.created_at).toLocaleString() : '-'}</span>
-        </div>
-        <div>
-          <DocumentStatusCell doc={doc} onComplete={fetchDocuments} />
-        </div>
+      <div className="flex items-center justify-between text-xs text-gray-500">
+        <span>{doc.size_bytes ? `${(doc.size_bytes / 1024).toFixed(2)} KB` : '-'}</span>
+        <span>{doc.created_at ? new Date(doc.created_at).toLocaleString() : '-'}</span>
+      </div>
+      <div className="flex items-center">
+        <DocumentStatusCell doc={doc} onComplete={fetchDocuments} />
       </div>
     </div>
   );
