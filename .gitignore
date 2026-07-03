@@ -11,3 +11,6 @@ __pycache__/
 backend/uploads/
 backend/vector_store/
 backend/uvicorn.*.log
+
+# 临时文件
+临时文件/
