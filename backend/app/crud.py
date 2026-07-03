@@ -4,6 +4,9 @@ from sqlalchemy.sql import func
 from . import models, schemas
 
 
+INTERRUPTED_DOCUMENT_STATUSES = ("uploaded", "processing", "parsing", "chunking", "indexing")
+
+
 def create_task(db: Session, task: schemas.TaskCreate):
     """创建任务并返回包含数据库生成 ID 的记录。"""
     db_task = models.Task(
@@ -92,6 +95,7 @@ def create_uploaded_document(
     file_ext: str,
     size_bytes: int,
     saved_to: str,
+    file_sha256: str | None = None,
 ):
     """创建上传文件记录，初始状态为 uploaded。"""
 
@@ -102,6 +106,7 @@ def create_uploaded_document(
         file_ext=file_ext,
         size_bytes=size_bytes,
         saved_to=saved_to,
+        file_sha256=file_sha256,
         status="uploaded",
     )
     db.add(document)
@@ -127,6 +132,30 @@ def mark_uploaded_document_processing(db: Session, document_id: int):
     return document
 
 
+def mark_uploaded_document_stage(
+    db: Session,
+    document_id: int,
+    *,
+    stage: str,
+    chunk_count: int | None = None,
+):
+    """更新文档处理阶段，供列表查询和 SSE 进度订阅使用。"""
+
+    document = get_uploaded_document(db, document_id)
+    if document is None:
+        return None
+
+    document.status = stage
+    document.error_message = None
+    if chunk_count is not None:
+        document.chunk_count = chunk_count
+
+    db.commit()
+    db.refresh(document)
+
+    return document
+
+
 def mark_uploaded_document_indexed(
     db: Session,
     document_id: int,
@@ -145,7 +174,8 @@ def mark_uploaded_document_indexed(
     document.status = "indexed"
     document.document_count = document_count
     document.chunk_count = chunk_count
-    document.file_sha256 = file_sha256
+    if file_sha256 is not None:
+        document.file_sha256 = file_sha256
     document.warnings = warnings
     document.error_message = None
 
@@ -171,6 +201,26 @@ def mark_uploaded_document_failed(db: Session, document_id: int, *, error_messag
     return document
 
 
+def fail_interrupted_uploaded_documents(db: Session) -> int:
+    """服务重启后，将无法继续执行的后台上传任务标记为失败。"""
+
+    interrupted_count = (
+        db.query(models.UploadedDocument)
+        .filter(models.UploadedDocument.status.in_(INTERRUPTED_DOCUMENT_STATUSES))
+        .update(
+            {
+                models.UploadedDocument.status: "failed",
+                models.UploadedDocument.error_message: (
+                    "服务重启导致后台处理任务中断，请删除后重新上传"
+                ),
+            },
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    return interrupted_count
+
+
 def get_uploaded_document(db: Session, document_id: int):
     """按 ID 查询上传文件记录。"""
 
@@ -189,6 +239,18 @@ def list_uploaded_documents(db: Session, skip: int = 0, limit: int = 20):
     )
 
 
+def delete_uploaded_document(db: Session, document_id: int) -> bool:
+    """删除上传文档记录；记录不存在时返回 False。"""
+
+    document = get_uploaded_document(db, document_id)
+    if document is None:
+        return False
+
+    db.delete(document)
+    db.commit()
+    return True
+
+
 def create_chat_session(db: Session, *, title: str | None = None, mode: str = "chat"):
     """创建一个多轮对话会话。"""
 
@@ -204,6 +266,18 @@ def get_chat_session(db: Session, session_id: int):
     """按 ID 查询会话。"""
 
     return db.query(models.ChatSession).filter(models.ChatSession.id == session_id).first()
+
+
+def delete_chat_session(db: Session, session_id: int) -> bool:
+    """删除会话及其关联消息；会话不存在时返回 False。"""
+
+    session = get_chat_session(db, session_id)
+    if session is None:
+        return False
+
+    db.delete(session)
+    db.commit()
+    return True
 
 
 def get_or_create_chat_session(

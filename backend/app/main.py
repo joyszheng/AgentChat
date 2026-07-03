@@ -1,17 +1,32 @@
+import asyncio
+import hashlib
+import json
 import logging
 import time
+from contextlib import asynccontextmanager
 from typing import Annotated
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Query, UploadFile, status
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    status,
+)
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from starlette.responses import FileResponse, StreamingResponse
 
 from pathlib import Path
 from uuid import uuid4
 
 from . import crud, models, schemas
-from .ai.document_processing import DocumentProcessingError
-from .ai.rag import ingest_upload
+from .ai.document_processing import DocumentProcessingError, validate_document_extension
+from .ai.rag import delete_document_from_index, ingest_upload
 from .database import SessionLocal, engine, get_db
 from .routers import tasks, ai
 
@@ -19,15 +34,51 @@ from .routers import tasks, ai
 # 开发阶段启动时自动建表；生产环境建议改用数据库迁移工具。
 models.Base.metadata.create_all(bind=engine)
 
-app = FastAPI()
 # Reuse Uvicorn's configured logger so INFO progress is visible in the server terminal.
 logger = logging.getLogger("uvicorn.error")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    with SessionLocal() as db:
+        interrupted_count = crud.fail_interrupted_uploaded_documents(db)
+    if interrupted_count:
+        logger.warning(
+            "[upload] Recovered interrupted tasks count=%s action=marked_failed",
+            interrupted_count,
+        )
+
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
+
+DOCUMENT_PROGRESS = {
+    "uploaded": (5, "文件已上传"),
+    "processing": (10, "等待开始处理"),
+    "parsing": (25, "正在解析文档内容"),
+    "chunking": (55, "正在清洗并切分文本"),
+    "indexing": (75, "正在生成向量并写入索引"),
+    "indexed": (100, "文档处理完成"),
+    "failed": (100, "文档处理失败"),
+}
+TERMINAL_DOCUMENT_STATUSES = {"indexed", "failed"}
+ACTIVE_DOCUMENT_STATUSES = {"uploaded", "processing", "parsing", "chunking", "indexing"}
+DOCUMENT_PROGRESS_POLL_INTERVAL = 0.5
+DOCUMENT_PROGRESS_UPDATE_INTERVAL = 3.0
+DOCUMENT_PROGRESS_STREAM_LIFETIME = 10.0
 
 # 允许本地前端开发服务器访问 API。
 origins = [
     "http://localhost:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3000",
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "http://frp-six.com:46189",
+    "https://frp-six.com:46189",
+    "https://noproblem.icu:46189",
+    "https://www.r853982.nyat.app:46189"
 ]
 
 # 添加跨域中间件，使前端能携带凭据调用后端接口。
@@ -37,6 +88,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 
 # 将任务相关路由注册到主应用。
@@ -71,11 +123,33 @@ def process_uploaded_document(
         file_path.name,
     )
     db = SessionLocal()
+
+    def update_stage(stage: str, *, chunk_count: int | None = None) -> None:
+        document = crud.mark_uploaded_document_stage(
+            db,
+            document_id,
+            stage=stage,
+            chunk_count=chunk_count,
+        )
+        if document is None:
+            raise RuntimeError(f"上传文档记录不存在：{document_id}")
+
+        progress, message = DOCUMENT_PROGRESS[stage]
+        logger.info(
+            "[upload:%s] Progress updated stage=%s progress=%s message=%s",
+            document_id,
+            stage,
+            progress,
+            message,
+        )
+
     try:
         processed, chunk_count = ingest_upload(
             file_path,
             original_filename=original_filename,
             content_type=content_type,
+            document_id=document_id,
+            progress_callback=update_stage,
         )
 
         file_sha256 = None
@@ -121,7 +195,15 @@ def process_uploaded_document(
         db.close()
 
 
-@app.post("/upload", status_code=status.HTTP_202_ACCEPTED)
+@app.post(
+    "/upload",
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={
+        status.HTTP_415_UNSUPPORTED_MEDIA_TYPE: {
+            "description": "文件格式不受支持",
+        },
+    },
+)
 async def upload_file(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
@@ -129,10 +211,37 @@ async def upload_file(
 ):
     """保存上传文件，并在后台解析文本、写入 RAG 检索索引。"""
 
-    content = await file.read()
-
     original_filename = file.filename or "uploaded-file"
-    suffix = Path(original_filename).suffix.lower()
+    logger.info(
+        "[upload] Request received file=%r content_type=%s",
+        original_filename,
+        file.content_type or "unknown",
+    )
+    try:
+        suffix = validate_document_extension(original_filename)
+    except DocumentProcessingError as exc:
+        logger.warning(
+            "[upload] Request rejected file=%r content_type=%s reason=%s",
+            original_filename,
+            file.content_type or "unknown",
+            exc,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=str(exc),
+        ) from exc
+
+    read_started_at = time.perf_counter()
+    content = await file.read()
+    logger.info(
+        "[upload] File read completed file=%r type=%s size=%s bytes elapsed=%.3fs",
+        original_filename,
+        suffix,
+        len(content),
+        time.perf_counter() - read_started_at,
+    )
+
+    file_sha256 = hashlib.sha256(content).hexdigest()
     new_filename = f"{uuid4().hex}{suffix}"
     file_path = UPLOAD_DIR / new_filename
 
@@ -146,6 +255,7 @@ async def upload_file(
         file_ext=suffix,
         size_bytes=len(content),
         saved_to=str(file_path),
+        file_sha256=file_sha256,
     )
     upload_record = crud.mark_uploaded_document_processing(db, upload_record.id)
 
@@ -190,3 +300,236 @@ def list_documents(
     """查询上传文档记录。"""
 
     return crud.list_uploaded_documents(db, skip=skip, limit=limit)
+
+
+@app.get("/documents/{document_id}/download")
+def download_document(
+    document_id: int,
+    db: Session = Depends(get_db),
+) -> FileResponse:
+    """下载上传时保存的原始文档。"""
+
+    document = crud.get_uploaded_document(db, document_id)
+    if document is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
+
+    stored_path = _resolve_upload_path(document.saved_to, document_id=document_id)
+    if not stored_path.is_file():
+        logger.warning(
+            "[upload:%s] Download failed reason=file_missing path=%s",
+            document_id,
+            stored_path,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE,
+            detail="文档原文件已不存在",
+        )
+
+    logger.info(
+        "[upload:%s] Original file download file=%r stored=%s size=%s bytes",
+        document_id,
+        document.original_filename,
+        stored_path.name,
+        stored_path.stat().st_size,
+    )
+    return FileResponse(
+        path=stored_path,
+        media_type=document.content_type or "application/octet-stream",
+        filename=document.original_filename,
+    )
+
+
+@app.delete(
+    "/documents/{document_id}",
+    response_model=schemas.UploadedDocumentDeleteResponse,
+)
+def delete_document(
+    document_id: int,
+    db: Session = Depends(get_db),
+) -> schemas.UploadedDocumentDeleteResponse:
+    """删除文档记录、本地文件，并在已生成分片时清理向量索引。"""
+
+    document = crud.get_uploaded_document(db, document_id)
+    if document is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
+
+    if document.status in ACTIVE_DOCUMENT_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="文档正在处理中，请等待处理完成或失败后再删除",
+        )
+
+    stored_path = _resolve_upload_path(document.saved_to, document_id=document_id)
+
+    vector_chunks_deleted = 0
+    if document.status == "indexed" or document.chunk_count > 0:
+        try:
+            vector_chunks_deleted = delete_document_from_index(
+                file_sha256=document.file_sha256,
+                source=document.saved_to,
+                document_id=document_id,
+            )
+        except Exception as exc:
+            logger.exception(
+                "[upload:%s] Delete failed stage=vector_cleanup error=%s",
+                document_id,
+                exc,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="向量索引清理失败，文档尚未删除，请稍后重试",
+            ) from exc
+
+    try:
+        file_deleted = stored_path.exists()
+        if file_deleted:
+            stored_path.unlink()
+    except OSError as exc:
+        logger.exception(
+            "[upload:%s] Delete failed stage=file_cleanup path=%s error=%s",
+            document_id,
+            stored_path,
+            exc,
+        )
+        raise HTTPException(status_code=500, detail="本地文件删除失败，请稍后重试") from exc
+
+    crud.delete_uploaded_document(db, document_id)
+    logger.info(
+        "[upload:%s] Document deleted file_deleted=%s vector_chunks_deleted=%s",
+        document_id,
+        file_deleted,
+        vector_chunks_deleted,
+    )
+    return schemas.UploadedDocumentDeleteResponse(
+        document_id=document_id,
+        deleted=True,
+        file_deleted=file_deleted,
+        vector_chunks_deleted=vector_chunks_deleted,
+    )
+
+
+@app.get("/documents/{document_id}/progress")
+async def stream_document_progress(document_id: int, request: Request) -> StreamingResponse:
+    """通过 SSE 推送文档解析和索引进度，直到成功或失败。"""
+
+    with SessionLocal() as db:
+        document = crud.get_uploaded_document(db, document_id)
+        if document is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="文档不存在")
+
+    async def event_stream():
+        last_payload: dict | None = None
+        stream_started_at = time.monotonic()
+        stage_started_at = stream_started_at
+        last_progress_event_at = stream_started_at
+
+        while not await request.is_disconnected():
+            with SessionLocal() as stream_db:
+                current_document = crud.get_uploaded_document(stream_db, document_id)
+                payload = (
+                    _document_progress_payload(current_document)
+                    if current_document is not None
+                    else None
+                )
+
+            if payload is None:
+                yield _sse_event(
+                    "failed",
+                    {
+                        "document_id": document_id,
+                        "code": "document_deleted",
+                        "message": "文档记录已被删除",
+                    },
+                )
+                return
+
+            if payload != last_payload:
+                event = "progress"
+                if payload["status"] == "indexed":
+                    event = "complete"
+                elif payload["status"] == "failed":
+                    event = "failed"
+
+                yield _sse_event(event, payload)
+                last_payload = payload
+                stage_started_at = time.monotonic()
+                last_progress_event_at = stage_started_at
+
+                if payload["status"] in TERMINAL_DOCUMENT_STATUSES:
+                    return
+
+            now = time.monotonic()
+            if (
+                last_payload is not None
+                and last_payload["status"] in ACTIVE_DOCUMENT_STATUSES
+                and now - last_progress_event_at >= DOCUMENT_PROGRESS_UPDATE_INTERVAL
+            ):
+                elapsed_seconds = int(now - stage_started_at)
+                progress_payload = {
+                    **last_payload,
+                    "stage_elapsed_seconds": elapsed_seconds,
+                    "detail": f"{last_payload['message']}，已持续 {elapsed_seconds} 秒",
+                }
+                yield _sse_event("progress", progress_payload)
+                last_progress_event_at = now
+
+            if now - stream_started_at >= DOCUMENT_PROGRESS_STREAM_LIFETIME:
+                yield _sse_event(
+                    "reconnect",
+                    {
+                        "document_id": document_id,
+                        "message": "进度流连接周期结束，客户端将自动重连",
+                    },
+                )
+                return
+
+            await asyncio.sleep(DOCUMENT_PROGRESS_POLL_INTERVAL)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+def _document_progress_payload(document) -> dict:
+    progress, message = DOCUMENT_PROGRESS.get(
+        document.status,
+        (0, "等待处理状态更新"),
+    )
+    return {
+        "document_id": document.id,
+        "filename": document.original_filename,
+        "status": document.status,
+        "progress": progress,
+        "message": message,
+        "document_count": document.document_count,
+        "chunk_count": document.chunk_count,
+        "warnings": document.warnings,
+        "error_message": document.error_message,
+        "updated_at": document.updated_at.isoformat(),
+    }
+
+
+def _resolve_upload_path(saved_to: str, *, document_id: int) -> Path:
+    stored_path = Path(saved_to).resolve()
+    upload_root = UPLOAD_DIR.resolve()
+    if not stored_path.is_relative_to(upload_root):
+        logger.error(
+            "[upload:%s] File access rejected reason=unsafe_path path=%s upload_root=%s",
+            document_id,
+            stored_path,
+            upload_root,
+        )
+        raise HTTPException(status_code=500, detail="文档存储路径异常，已拒绝访问")
+
+    return stored_path
+
+
+def _sse_event(event: str, data: dict) -> str:
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event}\ndata: {payload}\n\n"

@@ -54,6 +54,15 @@ class UploadedDocumentResponse(BaseModel):
     }
 
 
+class UploadedDocumentDeleteResponse(BaseModel):
+    """删除上传文档后返回的资源清理结果。"""
+
+    document_id: int
+    deleted: bool
+    file_deleted: bool
+    vector_chunks_deleted: int
+
+
 class ChatSessionCreate(BaseModel):
     """创建会话时使用的数据。"""
 

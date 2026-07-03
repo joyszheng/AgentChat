@@ -1,7 +1,9 @@
 import hashlib
+import json
 import logging
 import os
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from langchain_core.documents import Document
@@ -15,6 +17,7 @@ from .models import embeddings
 
 
 logger = logging.getLogger("uvicorn.error")
+ProgressCallback = Callable[..., None]
 
 # 1. 加载文档
 # path = Path("docs/agentchat-guide.md")
@@ -29,9 +32,12 @@ document = Document(
     metadata={"source": str(path)},
 )
 
+CHUNK_SIZE = 600
+CHUNK_OVERLAP = 100
+
 splitter = RecursiveCharacterTextSplitter(
-    chunk_size=600,
-    chunk_overlap=100,
+    chunk_size=CHUNK_SIZE,
+    chunk_overlap=CHUNK_OVERLAP,
     length_function=len,
 )
 
@@ -42,6 +48,7 @@ AGENTCHAT_MILVUS_URI = os.getenv("AGENTCHAT_MILVUS_URI", DEFAULT_MILVUS_URI)
 AGENTCHAT_MILVUS_COLLECTION = os.getenv("AGENTCHAT_MILVUS_COLLECTION", "agentchat_documents")
 AGENTCHAT_MILVUS_TOKEN = os.getenv("AGENTCHAT_MILVUS_TOKEN")
 AGENTCHAT_MILVUS_DB = os.getenv("AGENTCHAT_MILVUS_DB")
+VECTOR_OPERATION_TIMEOUT = float(os.getenv("AGENTCHAT_VECTOR_TIMEOUT_SECONDS", "60"))
 
 if AGENTCHAT_MILVUS_URI.endswith(".db"):
     Path(AGENTCHAT_MILVUS_URI).parent.mkdir(parents=True, exist_ok=True)
@@ -121,24 +128,68 @@ def _chunk_ids(documents: list[Document]) -> list[str]:
     return ids
 
 
-def _upsert_documents(documents: list[Document]) -> None:
+def _log_scope(document_id: int | None) -> str:
+    return f"upload:{document_id}" if document_id is not None else "rag"
+
+
+def _upsert_documents(
+    documents: list[Document],
+    *,
+    document_id: int | None = None,
+) -> None:
     store = get_vector_store()
     ids = _chunk_ids(documents)
     started_at = time.perf_counter()
+    scope = _log_scope(document_id)
+    total_characters = sum(len(document.page_content) for document in documents)
+    collection_exists = store.client.has_collection(
+        collection_name=AGENTCHAT_MILVUS_COLLECTION
+    )
+    operation = "upsert" if collection_exists else "create_and_add"
     logger.info(
-        "[rag] Embedding and Milvus write started collection=%s documents=%s",
+        "[%s] Vector indexing started collection=%s operation=%s chunks=%s "
+        "characters=%s embedding_dimensions=%s",
+        scope,
         AGENTCHAT_MILVUS_COLLECTION,
+        operation,
         len(documents),
+        total_characters,
+        getattr(embeddings, "dimensions", "provider_default"),
     )
 
-    if store.client.has_collection(collection_name=AGENTCHAT_MILVUS_COLLECTION):
-        store.upsert(ids=ids, documents=documents)
-    else:
-        store.add_documents(documents=documents, ids=ids)
+    try:
+        if collection_exists:
+            store.upsert(
+                ids=ids,
+                documents=documents,
+                timeout=VECTOR_OPERATION_TIMEOUT,
+            )
+        else:
+            store.add_documents(
+                documents=documents,
+                ids=ids,
+                timeout=VECTOR_OPERATION_TIMEOUT,
+            )
+    except Exception as exc:
+        logger.exception(
+            "[%s] Vector indexing failed collection=%s operation=%s chunks=%s "
+            "elapsed=%.2fs error_type=%s error=%s",
+            scope,
+            AGENTCHAT_MILVUS_COLLECTION,
+            operation,
+            len(documents),
+            time.perf_counter() - started_at,
+            type(exc).__name__,
+            exc,
+        )
+        raise
 
     logger.info(
-        "[rag] Embedding and Milvus write completed collection=%s documents=%s elapsed=%.2fs",
+        "[%s] Vector indexing completed collection=%s operation=%s chunks=%s "
+        "elapsed=%.2fs",
+        scope,
         AGENTCHAT_MILVUS_COLLECTION,
+        operation,
         len(documents),
         time.perf_counter() - started_at,
     )
@@ -156,24 +207,101 @@ def ensure_default_documents_indexed() -> None:
     logger.info("[rag] Default document indexing completed documents=%s", len(chunks))
 
 
-def add_documents_to_index(documents: list[Document]) -> int:
+def add_documents_to_index(
+    documents: list[Document],
+    *,
+    document_id: int | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> int:
     """Split cleaned documents and add them to the Milvus vector store."""
 
     started_at = time.perf_counter()
-    logger.info("[rag] Chunking started documents=%s", len(documents))
-    chunks = splitter.split_documents(documents)
+    scope = _log_scope(document_id)
+    source_characters = sum(len(document.page_content) for document in documents)
     logger.info(
-        "[rag] Chunking completed documents=%s chunks=%s elapsed=%.2fs",
+        "[%s] Chunking started documents=%s characters=%s chunk_size=%s overlap=%s",
+        scope,
+        len(documents),
+        source_characters,
+        CHUNK_SIZE,
+        CHUNK_OVERLAP,
+    )
+    chunks = splitter.split_documents(documents)
+    chunk_lengths = [len(chunk.page_content) for chunk in chunks]
+    logger.info(
+        "[%s] Chunking completed documents=%s chunks=%s min_chars=%s max_chars=%s "
+        "avg_chars=%.1f elapsed=%.2fs",
+        scope,
         len(documents),
         len(chunks),
+        min(chunk_lengths, default=0),
+        max(chunk_lengths, default=0),
+        sum(chunk_lengths) / len(chunk_lengths) if chunk_lengths else 0,
         time.perf_counter() - started_at,
     )
     if not chunks:
+        logger.warning("[%s] Indexing skipped reason=no_chunks", scope)
         return 0
 
+    if progress_callback is not None:
+        progress_callback("indexing", chunk_count=len(chunks))
+
     ensure_default_documents_indexed()
-    _upsert_documents(chunks)
+    _upsert_documents(chunks, document_id=document_id)
     return len(chunks)
+
+
+def delete_document_from_index(
+    *,
+    file_sha256: str | None,
+    source: str,
+    document_id: int | None = None,
+) -> int:
+    """按文件哈希（旧记录回退到源路径）删除文档的全部向量分片。"""
+
+    scope = _log_scope(document_id)
+    store = get_vector_store()
+    if not store.client.has_collection(collection_name=AGENTCHAT_MILVUS_COLLECTION):
+        logger.info(
+            "[%s] Vector cleanup skipped reason=collection_not_found collection=%s",
+            scope,
+            AGENTCHAT_MILVUS_COLLECTION,
+        )
+        return 0
+
+    if file_sha256:
+        expression = f'metadata["file_sha256"] == {json.dumps(file_sha256)}'
+        selector = f"sha256:{file_sha256[:12]}"
+    else:
+        expression = f'metadata["source"] == {json.dumps(source)}'
+        selector = "source_path"
+
+    started_at = time.perf_counter()
+    logger.info(
+        "[%s] Vector cleanup started collection=%s selector=%s",
+        scope,
+        AGENTCHAT_MILVUS_COLLECTION,
+        selector,
+    )
+    ids = store.get_pks(expression, timeout=VECTOR_OPERATION_TIMEOUT) or []
+    if not ids:
+        logger.info(
+            "[%s] Vector cleanup completed deleted_chunks=0 elapsed=%.2fs",
+            scope,
+            time.perf_counter() - started_at,
+        )
+        return 0
+
+    if not store.delete(ids=ids, timeout=VECTOR_OPERATION_TIMEOUT):
+        raise RuntimeError("Milvus 向量分片删除失败")
+
+    logger.info(
+        "[%s] Vector cleanup completed deleted_chunks=%s elapsed=%.2fs",
+        scope,
+        len(ids),
+        time.perf_counter() - started_at,
+    )
+    return len(ids)
 
 
 def ingest_upload(
@@ -181,13 +309,59 @@ def ingest_upload(
     *,
     original_filename: str | None = None,
     content_type: str | None = None,
+    document_id: int | None = None,
+    progress_callback: ProgressCallback | None = None,
 ) -> tuple[ProcessedDocument, int]:
+    started_at = time.perf_counter()
+    scope = _log_scope(document_id)
+    display_name = original_filename or file_path.name
+    logger.info(
+        "[%s] Ingestion pipeline started file=%r stored=%s content_type=%s size=%s bytes",
+        scope,
+        display_name,
+        file_path.name,
+        content_type or "unknown",
+        file_path.stat().st_size,
+    )
+
+    if progress_callback is not None:
+        progress_callback("parsing")
+
+    parse_started_at = time.perf_counter()
     processed = load_upload_documents(
         file_path,
         original_filename=original_filename,
         content_type=content_type,
     )
-    chunk_count = add_documents_to_index(processed.documents)
+    parsed_characters = sum(len(document.page_content) for document in processed.documents)
+    logger.info(
+        "[%s] Parse stage completed file=%r documents=%s characters=%s warnings=%s "
+        "elapsed=%.2fs",
+        scope,
+        display_name,
+        len(processed.documents),
+        parsed_characters,
+        len(processed.warnings),
+        time.perf_counter() - parse_started_at,
+    )
+
+    if progress_callback is not None:
+        progress_callback("chunking")
+
+    chunk_count = add_documents_to_index(
+        processed.documents,
+        document_id=document_id,
+        progress_callback=progress_callback,
+    )
+    logger.info(
+        "[%s] Ingestion pipeline completed file=%r documents=%s chunks=%s "
+        "elapsed=%.2fs",
+        scope,
+        display_name,
+        len(processed.documents),
+        chunk_count,
+        time.perf_counter() - started_at,
+    )
 
     return processed, chunk_count
 
@@ -217,7 +391,7 @@ def ask_document(question: str) -> tuple[str, list[str]]:
     answer = _generate_answer(context=context, question=question)
 
     sources = sorted({
-        doc.metadata.get("source", "未知来源")
+        doc.metadata.get("original_filename") or doc.metadata.get("source", "未知来源")
         for doc in documents
     })
 

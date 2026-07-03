@@ -11,11 +11,12 @@ EMBEDDING_DIMENSIONS = int(os.getenv("AGENTCHAT_EMBEDDING_DIMENSIONS", "1024"))
 
 llm = ChatOpenAI(
     # model="z-ai/glm-5.1",
-    model="qwen/qwen3.5-122b-a10b",
-    # model="moonshotai/kimi-k2.6",
+    # model="qwen/qwen3.5-122b-a10b",
+    model="moonshotai/kimi-k2.6",
     base_url=AI_BASE_URL,
     api_key=AI_API_KEY,
     timeout=30,
+    max_retries=2,
 )
 
 embeddings = OpenAIEmbeddings(
@@ -24,6 +25,7 @@ embeddings = OpenAIEmbeddings(
     base_url=AI_BASE_URL,
     api_key=AI_API_KEY,
     timeout=30,
+    max_retries=2,
     tiktoken_enabled=False,
     check_embedding_ctx_length=False,
 )

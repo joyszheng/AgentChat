@@ -1,0 +1,66 @@
+@import "tailwindcss";
+@source "../";
+:root {
+  --background: #ffffff;
+  --foreground: #171717;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --background: #0a0a0a;
+    --foreground: #ededed;
+  }
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+/* Remove blue focus ring for Ant Design X Sender and standard Inputs */
+.ant-sender,
+.ant-sender-focused,
+.ant-input,
+.ant-input-focused,
+.ant-input:focus,
+.ant-input-affix-wrapper:focus,
+.ant-input-affix-wrapper-focused {
+  box-shadow: none !important;
+  border-color: #d9d9d9 !important;
+}
+
+/* Remove browser default blue outline on the inner input/textarea */
+.ant-sender input:focus,
+.ant-sender textarea:focus,
+.ant-sender input:focus-visible,
+.ant-sender textarea:focus-visible,
+.ant-input:focus-visible,
+textarea:focus,
+input:focus {
+  outline: none !important;
+}
+
+/* User Bubble Gradient */
+.bubble-user .ant-bubble-content {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) !important;
+  color: #ffffff !important;
+  border: none !important;
+  box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06) !important;
+}
+
+/* Assistant Bubble Gradient */
+.bubble-assistant .ant-bubble-content {
+  background: linear-gradient(135deg, #ffffff 0%, #f9fafb 100%) !important;
+  color: #1f2937 !important;
+  border: 1px solid #e5e7eb !important;
+  box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05) !important;
+}
+
