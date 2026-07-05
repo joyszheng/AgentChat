@@ -16,12 +16,12 @@ def test_chat_persists_session_messages_and_uses_recent_history(monkeypatch, tmp
         return SimpleNamespace(content=f"回答 {len(prompts)}")
 
     fake_chain = SimpleNamespace(invoke=fake_invoke)
-    monkeypatch.setattr(ai_router, "chat_chain", fake_chain)
-    monkeypatch.setattr(main_module.ai, "chat_chain", fake_chain)
+    monkeypatch.setattr(ai_router, "create_chat_chain", lambda _llm: fake_chain)
+    monkeypatch.setattr(main_module.ai, "create_chat_chain", lambda _llm: fake_chain)
 
     client = TestClient(main_module.app)
 
-    first_response = client.post("/ai/chat", json={"message": "我的项目叫 AgentChat"})
+    first_response = client.post("/ai/chat", json={"message": "[TEST] 我的项目叫 AgentChat"})
     assert first_response.status_code == 200
     first_data = first_response.json()
     assert first_data["answer"] == "回答 1"
@@ -31,38 +31,36 @@ def test_chat_persists_session_messages_and_uses_recent_history(monkeypatch, tmp
         "/ai/chat",
         json={
             "session_id": first_data["session_id"],
-            "message": "我刚才说项目叫什么？",
+            "message": "[TEST] 我刚才说项目叫什么？",
         },
     )
     assert second_response.status_code == 200
     second_data = second_response.json()
     assert second_data["session_id"] == first_data["session_id"]
     assert second_data["answer"] == "回答 2"
-    assert "用户：我的项目叫 AgentChat" in prompts[1]
+    assert "用户：[TEST] 我的项目叫 AgentChat" in prompts[1]
     assert "助手：回答 1" in prompts[1]
 
     messages_response = client.get(f"/ai/sessions/{first_data['session_id']}/messages")
     assert messages_response.status_code == 200
     messages = messages_response.json()
     assert [message["role"] for message in messages] == ["user", "assistant", "user", "assistant"]
-    assert messages[0]["content"] == "我的项目叫 AgentChat"
+    assert messages[0]["content"] == "[TEST] 我的项目叫 AgentChat"
     assert messages[-1]["content"] == "回答 2"
 
 
-def test_delete_chat_session_cascades_messages(monkeypatch, tmp_path):
+def test_delete_chat_session_soft_deletes_and_retains_messages(monkeypatch, tmp_path):
     main_module = _load_main_with_fake_rag(monkeypatch, tmp_path)
     ai_router = importlib.import_module("app.routers.ai")
-    database = importlib.import_module("app.database")
-    models = importlib.import_module("app.models")
 
     fake_chain = SimpleNamespace(
         invoke=lambda _input_data: SimpleNamespace(content="待删除回答")
     )
-    monkeypatch.setattr(ai_router, "chat_chain", fake_chain)
-    monkeypatch.setattr(main_module.ai, "chat_chain", fake_chain)
+    monkeypatch.setattr(ai_router, "create_chat_chain", lambda _llm: fake_chain)
+    monkeypatch.setattr(main_module.ai, "create_chat_chain", lambda _llm: fake_chain)
 
     client = TestClient(main_module.app)
-    chat_response = client.post("/ai/chat", json={"message": "创建待删除会话"})
+    chat_response = client.post("/ai/chat", json={"message": "[TEST] 创建待删除会话"})
     session_id = chat_response.json()["session_id"]
 
     delete_response = client.delete(f"/ai/sessions/{session_id}")
@@ -71,14 +69,26 @@ def test_delete_chat_session_cascades_messages(monkeypatch, tmp_path):
     assert delete_response.content == b""
     assert client.get(f"/ai/sessions/{session_id}/messages").status_code == 404
     assert client.delete(f"/ai/sessions/{session_id}").status_code == 404
+    listed_session_ids = {
+        session["id"]
+        for session in client.get("/ai/sessions").json()
+    }
+    assert session_id not in listed_session_ids
 
-    with database.SessionLocal() as db:
+    route_models = main_module.ai.crud.models
+    with main_module.ai.SessionLocal() as db:
+        deleted_session = (
+            db.query(route_models.ChatSession)
+            .filter(route_models.ChatSession.id == session_id)
+            .one()
+        )
         message_count = (
-            db.query(models.ChatMessage)
-            .filter(models.ChatMessage.session_id == session_id)
+            db.query(route_models.ChatMessage)
+            .filter(route_models.ChatMessage.session_id == session_id)
             .count()
         )
-    assert message_count == 0
+    assert deleted_session.deleted_at is not None
+    assert message_count == 2
 
 
 def test_chat_stream_emits_sse_and_persists_complete_answer(monkeypatch, tmp_path):
@@ -92,11 +102,11 @@ def test_chat_stream_emits_sse_and_persists_complete_answer(monkeypatch, tmp_pat
         yield SimpleNamespace(content=[{"type": "text", "text": "，世界"}])
 
     fake_chain = SimpleNamespace(astream=fake_astream)
-    monkeypatch.setattr(ai_router, "chat_chain", fake_chain)
-    monkeypatch.setattr(main_module.ai, "chat_chain", fake_chain)
+    monkeypatch.setattr(ai_router, "create_chat_chain", lambda _llm: fake_chain)
+    monkeypatch.setattr(main_module.ai, "create_chat_chain", lambda _llm: fake_chain)
 
     client = TestClient(main_module.app)
-    response = client.post("/ai/chat/stream", json={"message": "流式回答我"})
+    response = client.post("/ai/chat/stream", json={"message": "[TEST] 流式回答我"})
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/event-stream")
@@ -109,7 +119,7 @@ def test_chat_stream_emits_sse_and_persists_complete_answer(monkeypatch, tmp_pat
     assert events[2]["data"] == {"delta": "，世界"}
     assert events[0]["data"]["session_id"] == events[-1]["data"]["session_id"]
     assert isinstance(events[-1]["data"]["assistant_message_id"], int)
-    assert "当前用户问题：\n流式回答我" in prompts[0]
+    assert "当前用户问题：\n[TEST] 流式回答我" in prompts[0]
 
     session_id = events[0]["data"]["session_id"]
     messages_response = client.get(f"/ai/sessions/{session_id}/messages")
@@ -128,11 +138,11 @@ def test_chat_stream_emits_error_without_persisting_partial_answer(monkeypatch, 
         raise RuntimeError("模拟流式模型故障")
 
     fake_chain = SimpleNamespace(astream=failing_astream)
-    monkeypatch.setattr(ai_router, "chat_chain", fake_chain)
-    monkeypatch.setattr(main_module.ai, "chat_chain", fake_chain)
+    monkeypatch.setattr(ai_router, "create_chat_chain", lambda _llm: fake_chain)
+    monkeypatch.setattr(main_module.ai, "create_chat_chain", lambda _llm: fake_chain)
 
     client = TestClient(main_module.app)
-    response = client.post("/ai/chat/stream", json={"message": "触发错误"})
+    response = client.post("/ai/chat/stream", json={"message": "[TEST] 触发错误"})
 
     assert response.status_code == 200
     events = _parse_sse_events(response.text)
@@ -167,26 +177,26 @@ def test_chat_stream_falls_back_when_follow_up_returns_no_chunks(monkeypatch, tm
         return SimpleNamespace(content="第二轮兜底回答")
 
     fake_chain = SimpleNamespace(astream=fake_astream, ainvoke=fake_ainvoke)
-    monkeypatch.setattr(ai_router, "chat_chain", fake_chain)
-    monkeypatch.setattr(main_module.ai, "chat_chain", fake_chain)
+    monkeypatch.setattr(ai_router, "create_chat_chain", lambda _llm: fake_chain)
+    monkeypatch.setattr(main_module.ai, "create_chat_chain", lambda _llm: fake_chain)
 
     client = TestClient(main_module.app)
-    first_response = client.post("/ai/chat/stream", json={"message": "第一轮问题"})
+    first_response = client.post("/ai/chat/stream", json={"message": "[TEST] 第一轮问题"})
     first_events = _parse_sse_events(first_response.text)
     session_id = first_events[0]["data"]["session_id"]
 
     second_response = client.post(
         "/ai/chat/stream",
-        json={"session_id": session_id, "message": "第二轮问题"},
+        json={"session_id": session_id, "message": "[TEST] 第二轮问题"},
     )
     second_events = _parse_sse_events(second_response.text)
 
     assert second_response.status_code == 200
     assert [event["event"] for event in second_events] == ["start", "token", "done"]
     assert second_events[1]["data"] == {"delta": "第二轮兜底回答"}
-    assert "用户：第一轮问题" in fallback_prompts[0]
+    assert "用户：[TEST] 第一轮问题" in fallback_prompts[0]
     assert "助手：第一轮回答" in fallback_prompts[0]
-    assert "当前用户问题：\n第二轮问题" in fallback_prompts[0]
+    assert "当前用户问题：\n[TEST] 第二轮问题" in fallback_prompts[0]
 
     messages = client.get(f"/ai/sessions/{session_id}/messages").json()
     assert [message["role"] for message in messages] == [
@@ -210,13 +220,13 @@ def _parse_sse_events(body: str) -> list[dict]:
 
 def _load_main_with_fake_rag(monkeypatch, tmp_path):
     fake_rag = ModuleType("app.ai.rag")
-    fake_rag.ask_document = lambda _question: ("", [])
+    fake_rag.ask_document = lambda _question, **_kwargs: ("", [])
     fake_rag.ingest_upload = lambda *_args, **_kwargs: (None, 0)
     fake_rag.delete_document_from_index = lambda **_kwargs: 0
 
     database_url = f"sqlite:///{(tmp_path / 'test.db').as_posix()}"
     monkeypatch.setenv("DATABASE_URL", database_url)
-    monkeypatch.setenv("GLM_API_KEY", "test-api-key")
+    monkeypatch.setenv("LLM_API_KEY", "test-api-key")
     monkeypatch.setitem(sys.modules, "app.ai.rag", fake_rag)
     sys.modules.pop("app.crud", None)
     sys.modules.pop("app.database", None)

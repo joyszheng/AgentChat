@@ -3,7 +3,6 @@
 import logging
 import os
 from functools import lru_cache
-from pathlib import Path
 
 from sqlalchemy.orm import Session
 
@@ -12,6 +11,53 @@ from .encryption import decrypt_value
 
 
 logger = logging.getLogger("uvicorn.error")
+
+LEGACY_LLM_API_KEY = "glm_api_key"
+LLM_API_KEY = "llm_api_key"
+LEGACY_LLM_BASE_URL = "ai_base_url"
+LLM_BASE_URL = "llm_base_url"
+LEGACY_LLM_MODEL = "ai_model"
+LLM_MODEL = "llm_model"
+
+
+def _migrate_setting_key(db: Session, legacy_key: str, current_key: str) -> bool:
+    """Rename one database setting while preserving encrypted values as-is."""
+    legacy_setting = crud.get_system_setting(db, legacy_key)
+    if legacy_setting is None:
+        return False
+
+    current_setting = crud.get_system_setting(db, current_key)
+    if current_setting is None:
+        crud.upsert_system_setting(
+            db,
+            key=current_key,
+            value=legacy_setting.value,
+            category=legacy_setting.category,
+            is_encrypted=legacy_setting.is_encrypted,
+            description=legacy_setting.description,
+        )
+
+    crud.delete_system_setting(db, legacy_key)
+    return True
+
+
+def migrate_legacy_llm_api_key(db: Session) -> bool:
+    """Rename the legacy database setting without exposing or re-encrypting it."""
+    return _migrate_setting_key(db, LEGACY_LLM_API_KEY, LLM_API_KEY)
+
+
+def migrate_legacy_ai_settings(db: Session) -> list[tuple[str, str]]:
+    """Move legacy shared AI keys into the LLM-specific namespace."""
+    migrations = (
+        (LEGACY_LLM_API_KEY, LLM_API_KEY),
+        (LEGACY_LLM_BASE_URL, LLM_BASE_URL),
+        (LEGACY_LLM_MODEL, LLM_MODEL),
+    )
+    migrated: list[tuple[str, str]] = []
+    for legacy_key, current_key in migrations:
+        if _migrate_setting_key(db, legacy_key, current_key):
+            migrated.append((legacy_key, current_key))
+    return migrated
 
 
 class ConfigService:

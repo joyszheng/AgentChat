@@ -262,20 +262,23 @@ def create_chat_session(db: Session, *, title: str | None = None, mode: str = "c
     return session
 
 
-def get_chat_session(db: Session, session_id: int):
-    """按 ID 查询会话。"""
+def get_chat_session(db: Session, session_id: int, *, include_deleted: bool = False):
+    """按 ID 查询会话，默认排除已软删除的记录。"""
 
-    return db.query(models.ChatSession).filter(models.ChatSession.id == session_id).first()
+    query = db.query(models.ChatSession).filter(models.ChatSession.id == session_id)
+    if not include_deleted:
+        query = query.filter(models.ChatSession.deleted_at.is_(None))
+    return query.first()
 
 
 def delete_chat_session(db: Session, session_id: int) -> bool:
-    """删除会话及其关联消息；会话不存在时返回 False。"""
+    """软删除会话并保留关联消息；会话不存在时返回 False。"""
 
     session = get_chat_session(db, session_id)
     if session is None:
         return False
 
-    db.delete(session)
+    session.deleted_at = func.now()
     db.commit()
     return True
 
@@ -300,6 +303,7 @@ def list_chat_sessions(db: Session, skip: int = 0, limit: int = 20):
 
     return (
         db.query(models.ChatSession)
+        .filter(models.ChatSession.deleted_at.is_(None))
         .order_by(
             models.ChatSession.last_message_at.desc().nullslast(),
             models.ChatSession.created_at.desc(),

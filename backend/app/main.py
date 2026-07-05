@@ -18,6 +18,7 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import DateTime, inspect, text
 from sqlalchemy.orm import Session
 from starlette.responses import FileResponse, StreamingResponse
 
@@ -26,24 +27,72 @@ from uuid import uuid4
 
 from . import crud, models, schemas
 from .ai.document_processing import DocumentProcessingError, validate_document_extension
+from .ai.config import get_embeddings_from_config
 from .ai.rag import delete_document_from_index, ingest_upload
 from .database import SessionLocal, engine, get_db
-from .routers import tasks, ai, settings, auth
+from .routers import tasks, ai, settings, auth, mcp as mcp_router
+from .mcp import mcp_registry
 from .services.email import send_email, format_document_notification_email
 from .services.dependencies import require_auth
+from .services.config import migrate_legacy_ai_settings
+
+
+def _ensure_chat_session_soft_delete_schema() -> bool:
+    """Add deleted_at and its index for installations created before soft deletion."""
+    inspector = inspect(engine)
+    if not inspector.has_table("chat_sessions"):
+        return False
+
+    schema_changed = False
+    column_names = {
+        column["name"]
+        for column in inspector.get_columns("chat_sessions")
+    }
+    if "deleted_at" not in column_names:
+        column_type = DateTime(timezone=True).compile(dialect=engine.dialect)
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "ALTER TABLE chat_sessions "
+                    f"ADD COLUMN deleted_at {column_type} NULL"
+                )
+            )
+        schema_changed = True
+
+    index_names = {
+        index["name"]
+        for index in inspect(engine).get_indexes("chat_sessions")
+    }
+    if "ix_chat_sessions_deleted_at" not in index_names:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_chat_sessions_deleted_at "
+                    "ON chat_sessions (deleted_at)"
+                )
+            )
+        schema_changed = True
+
+    return schema_changed
 
 
 # 开发阶段启动时自动建表；生产环境建议改用数据库迁移工具。
 models.Base.metadata.create_all(bind=engine)
+soft_delete_schema_added = _ensure_chat_session_soft_delete_schema()
 
 # Reuse Uvicorn's configured logger so INFO progress is visible in the server terminal.
 logger = logging.getLogger("uvicorn.error")
+if soft_delete_schema_added:
+    logger.info("[database] Ensured chat_sessions soft-delete schema")
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     with SessionLocal() as db:
+        migrated_ai_settings = migrate_legacy_ai_settings(db)
         interrupted_count = crud.fail_interrupted_uploaded_documents(db)
+    for legacy_key, current_key in migrated_ai_settings:
+        logger.info("[config] Migrated setting key %s -> %s", legacy_key, current_key)
     if interrupted_count:
         logger.warning(
             "[upload] Recovered interrupted tasks count=%s action=marked_failed",
@@ -88,7 +137,12 @@ async def lifespan(_app: FastAPI):
                 "[auth] ============================================"
             )
 
-    yield
+    _app.state.mcp_registry = mcp_registry
+    await mcp_registry.refresh()
+    try:
+        yield
+    finally:
+        await mcp_registry.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -136,6 +190,7 @@ app.include_router(ai.router)
 app.include_router(tasks.router)
 app.include_router(settings.router)
 app.include_router(auth.router)
+app.include_router(mcp_router.router)
 
 
 @app.get("/")
@@ -271,6 +326,7 @@ def process_uploaded_document(
             content_type=content_type,
             document_id=document_id,
             progress_callback=update_stage,
+            embedding_function=get_embeddings_from_config(db),
         )
 
         file_sha256 = None

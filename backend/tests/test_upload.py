@@ -24,10 +24,12 @@ def test_upload_indexes_saved_file(monkeypatch, tmp_path):
         content_type=None,
         document_id=None,
         progress_callback=None,
+        embedding_function=None,
     ):
         assert file_path.exists()
         assert original_filename == "guide.md"
         assert content_type == "text/markdown"
+        assert embedding_function is not None
         assert isinstance(document_id, int)
         for stage in ("parsing", "chunking", "indexing"):
             progress_callback(stage)
@@ -289,13 +291,13 @@ def _parse_sse_events(body: str) -> list[dict]:
 
 def _load_main_with_fake_rag(monkeypatch, tmp_path):
     fake_rag = ModuleType("app.ai.rag")
-    fake_rag.ask_document = lambda _question: ("", [])
+    fake_rag.ask_document = lambda _question, **_kwargs: ("", [])
     fake_rag.ingest_upload = lambda *_args, **_kwargs: (ProcessedDocument(documents=[]), 0)
     fake_rag.delete_document_from_index = lambda **_kwargs: 0
 
     database_url = f"sqlite:///{(tmp_path / 'test.db').as_posix()}"
     monkeypatch.setenv("DATABASE_URL", database_url)
-    monkeypatch.setenv("GLM_API_KEY", "test-api-key")
+    monkeypatch.setenv("LLM_API_KEY", "test-api-key")
     monkeypatch.setitem(sys.modules, "app.ai.rag", fake_rag)
     sys.modules.pop("app.crud", None)
     sys.modules.pop("app.database", None)

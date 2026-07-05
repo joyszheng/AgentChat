@@ -10,7 +10,7 @@ client = TestClient(app)
 def test_ai_chat():
     response = client.post(
         "/ai/chat",
-        json={"message": "请用一句话介绍 FastAPI"},
+        json={"message": "[TEST] 请用一句话介绍 FastAPI"},
     )
 
     assert response.status_code == 200
@@ -23,7 +23,7 @@ def test_ai_chat():
 def test_tasks_assistant_query():
     response = client.post(
         "/ai/tasks-assistant",
-        json={"message": "查询前 3 条未完成任务"},
+        json={"message": "[TEST] 查询前 3 条未完成任务"},
     )
 
     assert response.status_code == 200
@@ -36,7 +36,7 @@ def test_tasks_assistant_query():
 def test_rag_answer():
     response = client.post(
         "/ai/rag",
-        json={"question": "AgentChat 项目的内部代号是什么？"},
+        json={"question": "[TEST] AgentChat 项目的内部代号是什么？"},
     )
 
     assert response.status_code == 200
@@ -68,11 +68,11 @@ def test_chat_returns_500_when_model_fails(monkeypatch):
         raise RuntimeError("模拟模型故障")
 
     fake_chain = SimpleNamespace(invoke=raise_model_error)
-    monkeypatch.setattr(ai_router, "chat_chain", fake_chain)
+    monkeypatch.setattr(ai_router, "create_chat_chain", lambda _llm: fake_chain)
 
     response = client.post(
         "/ai/chat",
-        json={"message": "你好"},
+        json={"message": "[TEST] 你好"},
     )
 
     assert response.status_code == 500
@@ -85,11 +85,11 @@ def test_tasks_assistant_returns_500_when_agent_fails(monkeypatch):
         raise RuntimeError("模拟 Agent 故障")
 
     fake_agent = SimpleNamespace(invoke=raise_agent_error)
-    monkeypatch.setattr(ai_router, "task_agent", fake_agent)
+    monkeypatch.setattr(ai_router, "create_task_agent", lambda _llm: fake_agent)
 
     response = client.post(
         "/ai/tasks-assistant",
-        json={"message": "查询未完成任务"},
+        json={"message": "[TEST] 查询未完成任务"},
     )
 
     assert response.status_code == 500
@@ -98,14 +98,14 @@ def test_tasks_assistant_returns_500_when_agent_fails(monkeypatch):
     }
 
 def test_rag_returns_500_when_service_fails(monkeypatch):
-    def raise_rag_error(_question):
+    def raise_rag_error(_question, *, llm, embedding_function):
         raise RuntimeError("模拟 RAG 故障")
 
     monkeypatch.setattr(ai_router, "ask_document", raise_rag_error)
 
     response = client.post(
         "/ai/rag",
-        json={"question": "内部代号是什么？"},
+        json={"question": "[TEST] 内部代号是什么？"},
     )
 
     assert response.status_code == 500

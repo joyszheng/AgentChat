@@ -1,10 +1,14 @@
 'use client';
 
 import React, { useState, useEffect, useRef } from 'react';
-import { MessageSquareIcon, BookTextIcon, PanelLeftCloseIcon, PanelLeftOpenIcon, SettingsIcon, LogoutIcon, UserIcon } from 'lucide-animated';
-import type { MessageSquareIconHandle, BookTextIconHandle, SettingsIconHandle } from 'lucide-animated';
+import { MessageSquareIcon, BookTextIcon, PanelLeftCloseIcon, PanelLeftOpenIcon, PlugZapIcon, SettingsIcon, LogoutIcon, UserIcon } from 'lucide-animated';
 import { useRouter, usePathname } from 'next/navigation';
 import { isAuthenticated, isAdmin, getCurrentUser, logout } from '@/lib/auth';
+
+type AnimatedIconHandle = {
+  startAnimation?: () => void;
+  stopAnimation?: () => void;
+};
 
 export default function AppLayout({ children }: { children: React.ReactNode }) {
   const [mounted, setMounted] = useState(false);
@@ -18,13 +22,15 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
 
   useEffect(() => {
-    setMounted(true);
-    // 检查登录状态
-    setAuthState({
-      isLoggedIn: isAuthenticated(),
-      isAdminUser: isAdmin(),
-      username: getCurrentUser()?.username || '',
-    });
+    const timer = window.setTimeout(() => {
+      setMounted(true);
+      setAuthState({
+        isLoggedIn: isAuthenticated(),
+        isAdminUser: isAdmin(),
+        username: getCurrentUser()?.username || '',
+      });
+    }, 0);
+    return () => window.clearTimeout(timer);
   }, [pathname]);
 
   const menuItems = [
@@ -41,6 +47,13 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
       requireAuth: false,
     },
     {
+      key: '/mcp',
+      IconComponent: PlugZapIcon,
+      label: 'MCP 工具',
+      requireAuth: true,
+      requireAdmin: true,
+    },
+    {
       key: '/settings',
       IconComponent: SettingsIcon,
       label: '系统设置',
@@ -49,7 +62,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
     }
   ];
 
-  const iconRefs = useRef<{ [key: string]: any }>({});
+  const iconRefs = useRef<Record<string, AnimatedIconHandle | null>>({});
 
   // 过滤菜单项：只显示有权限的菜单
   const visibleMenuItems = menuItems.filter(item => {
@@ -89,7 +102,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
                 title={collapsed ? item.label : undefined}
               >
                 <item.IconComponent
-                  ref={(el: any) => iconRefs.current[item.key] = el}
+                  ref={(el) => { iconRefs.current[item.key] = el; }}
                   size={20}
                 />
                 {!collapsed && <span className="font-medium truncate">{item.label}</span>}
@@ -146,7 +159,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
         
         {/* Mobile Bottom Navigation */}
         <div className="md:hidden flex bg-white border-t border-gray-100 pb-[env(safe-area-inset-bottom)] shadow-[0_-2px_10px_rgba(0,0,0,0.03)] z-50">
-          {menuItems.map(item => {
+          {visibleMenuItems.map(item => {
             const isActive = pathname === item.key;
             return (
               <div

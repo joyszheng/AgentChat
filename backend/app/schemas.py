@@ -1,6 +1,8 @@
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from typing import Any, Literal
+
+from pydantic import AnyHttpUrl, BaseModel, Field, field_validator
 
 
 class TaskCreate(BaseModel):
@@ -80,6 +82,7 @@ class ChatSessionResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     last_message_at: datetime | None
+    deleted_at: datetime | None
 
     model_config = {
         "from_attributes": True
@@ -115,6 +118,12 @@ class ChatResponse(BaseModel):
     session_id: int
     user_message_id: int
     assistant_message_id: int
+
+
+class MCPAssistantResponse(ChatResponse):
+    """Response from the assistant that may invoke registered MCP tools."""
+
+    tools_used: list[str] = Field(default_factory=list)
 
 
 class SystemSettingBase(BaseModel):
@@ -153,6 +162,109 @@ class SystemSettingBatchUpdate(BaseModel):
     """批量更新系统配置。"""
 
     settings: list[SystemSettingCreate]
+
+
+class MCPServerBase(BaseModel):
+    """Common configuration for a remote MCP server."""
+
+    name: str = Field(min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9_-]+$")
+    description: str | None = Field(default=None, max_length=500)
+    transport: Literal["streamable_http"] = "streamable_http"
+    url: AnyHttpUrl
+    enabled: bool = False
+    require_admin: bool = True
+    allowed_tools: list[str] = Field(default_factory=list)
+    call_timeout_seconds: int = Field(default=20, ge=1, le=300)
+    max_result_chars: int = Field(default=20000, ge=1000, le=200000)
+
+    @field_validator("allowed_tools")
+    @classmethod
+    def normalize_allowed_tools(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for tool_name in value:
+            name = tool_name.strip()
+            if name and name not in normalized:
+                normalized.append(name)
+        return normalized
+
+
+class MCPServerCreate(MCPServerBase):
+    """Register a new MCP server. Headers are encrypted before storage."""
+
+    headers: dict[str, str] = Field(default_factory=dict)
+
+
+class MCPServerUpdate(BaseModel):
+    """Partially update an MCP server. Omitted headers preserve current credentials."""
+
+    description: str | None = Field(default=None, max_length=500)
+    url: AnyHttpUrl | None = None
+    headers: dict[str, str] | None = None
+    enabled: bool | None = None
+    require_admin: bool | None = None
+    allowed_tools: list[str] | None = None
+    call_timeout_seconds: int | None = Field(default=None, ge=1, le=300)
+    max_result_chars: int | None = Field(default=None, ge=1000, le=200000)
+
+    @field_validator("allowed_tools")
+    @classmethod
+    def normalize_optional_allowed_tools(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        normalized: list[str] = []
+        for tool_name in value:
+            name = tool_name.strip()
+            if name and name not in normalized:
+                normalized.append(name)
+        return normalized
+
+
+class MCPServerResponse(BaseModel):
+    """MCP server configuration without secret header values."""
+
+    id: int
+    name: str
+    description: str | None
+    transport: str
+    url: str
+    enabled: bool
+    require_admin: bool
+    allowed_tools: list[str]
+    discovered_tools: list[str]
+    header_names: list[str]
+    call_timeout_seconds: int
+    max_result_chars: int
+    last_health_status: str
+    last_error: str | None
+    last_checked_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
+
+
+class MCPToolInfo(BaseModel):
+    """A tool discovered from an MCP server."""
+
+    server_id: int
+    server_name: str
+    name: str
+    qualified_name: str
+    description: str
+    enabled: bool
+    require_admin: bool
+
+
+class MCPToolInvokeRequest(BaseModel):
+    """Arguments for an administrator-initiated MCP tool call."""
+
+    arguments: dict[str, Any] = Field(default_factory=dict)
+
+
+class MCPToolInvokeResponse(BaseModel):
+    """Result of an administrator-initiated MCP tool call."""
+
+    qualified_name: str
+    result: Any
+    duration_ms: int
 
 
 class UserLogin(BaseModel):

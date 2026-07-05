@@ -16,7 +16,7 @@ def add(a: int, b: int) -> int:
 model = ChatOpenAI(
     model="z-ai/glm-5.1",
     base_url="https://ai.hybgzs.com/v1",
-    api_key=os.environ["GLM_API_KEY"],
+    api_key=os.environ["LLM_API_KEY"],
     timeout=30,
 )
 

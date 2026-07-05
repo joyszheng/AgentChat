@@ -17,6 +17,34 @@ logger = logging.getLogger("uvicorn.error")
 router = APIRouter(prefix="/settings", tags=["settings"])
 
 
+def _value_for_storage(db: Session, setting_data: schemas.SystemSettingCreate) -> str:
+    """Encrypt a new secret, or keep the ciphertext when the client sends its mask."""
+    if not setting_data.is_encrypted or not setting_data.value:
+        return setting_data.value
+
+    existing = crud.get_system_setting(db, setting_data.key)
+    if existing is not None and existing.is_encrypted:
+        if setting_data.value == "******":
+            return existing.value
+
+        try:
+            current_value = decrypt_value(existing.value)
+            current_mask = mask_sensitive_value(
+                current_value,
+                show_first=3,
+                show_last=3,
+            )
+            if setting_data.value == current_mask:
+                return existing.value
+        except Exception:
+            logger.exception(
+                "[settings] Failed to compare masked setting key=%s",
+                setting_data.key,
+            )
+
+    return encrypt_value(setting_data.value)
+
+
 @router.get("", response_model=list[schemas.SystemSettingResponse])
 def list_settings(
     category: Annotated[str | None, Query()] = None,
@@ -101,17 +129,14 @@ def upsert_setting(
             detail="URL 中的 key 与请求体中的 key 不一致",
         )
 
-    # 如果需要加密，先加密 value
-    value_to_store = setting_data.value
-    if setting_data.is_encrypted and setting_data.value:
-        try:
-            value_to_store = encrypt_value(setting_data.value)
-        except Exception as exc:
-            logger.exception("[settings] Encryption failed key=%s error=%s", key, exc)
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="配置加密失败",
-            ) from exc
+    try:
+        value_to_store = _value_for_storage(db, setting_data)
+    except Exception as exc:
+        logger.exception("[settings] Encryption failed key=%s error=%s", key, exc)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="配置加密失败",
+        ) from exc
 
     setting = crud.upsert_system_setting(
         db,
@@ -161,20 +186,8 @@ def batch_upsert_settings(
     result = []
 
     for setting_data in batch_data.settings:
-        # 如果需要加密，先加密 value
-        value_to_store = setting_data.value
-        if setting_data.is_encrypted and setting_data.value:
-            try:
-                value_to_store = encrypt_value(setting_data.value)
-            except Exception as exc:
-                logger.exception(
-                    "[settings] Encryption failed key=%s error=%s",
-                    setting_data.key,
-                    exc,
-                )
-                continue
-
         try:
+            value_to_store = _value_for_storage(db, setting_data)
             setting = crud.upsert_system_setting(
                 db,
                 key=setting_data.key,

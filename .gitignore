@@ -11,6 +11,8 @@ __pycache__/
 backend/uploads/
 backend/vector_store/
 backend/uvicorn.*.log
+backend/.mcp-ui-*.log
 
 # 临时文件
 临时文件/
+.claude/

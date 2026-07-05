@@ -10,10 +10,13 @@ from sqlalchemy.orm import Session
 from starlette.responses import StreamingResponse
 
 from .. import crud, schemas
-from ..ai.agents import task_agent
-from ..ai.chains import chat_chain
+from ..ai.agents import create_mcp_agent, create_task_agent
+from ..ai.chains import create_chat_chain
+from ..ai.config import get_embeddings_from_config, get_llm_from_config
 from ..ai.rag import ask_document
 from ..database import SessionLocal, get_db
+from ..mcp import mcp_registry
+from ..services.dependencies import require_auth
 
 router = APIRouter(prefix="/ai", tags=["AI"])
 logger = logging.getLogger(__name__)
@@ -68,6 +71,7 @@ def list_chat_messages(
 @router.post("/chat", response_model=schemas.ChatResponse)
 def chat(request: schemas.ChatRequest, db: Session = Depends(get_db)) -> schemas.ChatResponse:
     session, user_message, model_input = _prepare_chat_request(request, db)
+    chat_chain = create_chat_chain(get_llm_from_config(db))
 
     try:
         response = chat_chain.invoke({"message": model_input})
@@ -99,6 +103,7 @@ async def chat_stream(
     """以 SSE 逐段返回聊天结果，并在完整生成后保存助手消息。"""
 
     session, user_message, model_input = _prepare_chat_request(request, db)
+    chat_chain = create_chat_chain(get_llm_from_config(db))
     session_id = session.id
     user_message_id = user_message.id
 
@@ -114,7 +119,7 @@ async def chat_stream(
         answer_parts: list[str] = []
 
         try:
-            async for text in _stream_chat_text(model_input):
+            async for text in _stream_chat_text(model_input, chat_chain):
                 answer_parts.append(text)
                 yield _sse_event("token", {"delta": text})
 
@@ -186,8 +191,12 @@ def _prepare_chat_request(request: schemas.ChatRequest, db: Session):
 
 
 @router.post("/tasks-assistant", response_model=TextResponse)
-def tasks_assistant(request: schemas.ChatRequest) -> TextResponse:
+def tasks_assistant(
+    request: schemas.ChatRequest,
+    db: Session = Depends(get_db),
+) -> TextResponse:
     try:
+        task_agent = create_task_agent(get_llm_from_config(db))
         result = task_agent.invoke({
             "messages": [{
                 "role": "user",
@@ -204,6 +213,59 @@ def tasks_assistant(request: schemas.ChatRequest) -> TextResponse:
             status_code=500,
             detail="任务助手暂时不可用，请稍后再试"
         )
+
+
+@router.post("/mcp-assistant", response_model=schemas.MCPAssistantResponse)
+async def mcp_assistant(
+    request: schemas.ChatRequest,
+    db: Session = Depends(get_db),
+    user=Depends(require_auth),
+) -> schemas.MCPAssistantResponse:
+    """Use enabled MCP tools through a request-scoped LangChain agent."""
+
+    tools = mcp_registry.get_tools(is_admin=user.role == "admin")
+    if not tools:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="当前没有可用的 MCP 工具",
+        )
+
+    session, user_message, model_input = _prepare_chat_request(request, db)
+    agent = create_mcp_agent(get_llm_from_config(db), tools)
+
+    try:
+        result = await agent.ainvoke(
+            {"messages": [{"role": "user", "content": model_input}]}
+        )
+        messages = result.get("messages", [])
+        answer = _last_assistant_text(messages)
+        tools_used = _tools_used(messages)
+        if not answer:
+            raise ValueError("MCP agent returned an empty response")
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail="MCP 工具助手暂时不可用，请稍后重试",
+        )
+
+    assistant_message = crud.create_chat_message(
+        db,
+        session_id=session.id,
+        role="assistant",
+        content=answer,
+        message_metadata={
+            "model": "mcp-assistant",
+            "tools_used": tools_used,
+        },
+    )
+    return schemas.MCPAssistantResponse(
+        answer=answer,
+        session_id=session.id,
+        user_message_id=user_message.id,
+        assistant_message_id=assistant_message.id,
+        tools_used=tools_used,
+    )
     
 
 class RagRequest(BaseModel):
@@ -215,9 +277,13 @@ class RagResponse(BaseModel):
     sources: list[str]
 
 @router.post("/rag", response_model=RagResponse)
-def rag(request: RagRequest) -> RagResponse:
+def rag(request: RagRequest, db: Session = Depends(get_db)) -> RagResponse:
     try:
-        answer, sources = ask_document(request.question)
+        answer, sources = ask_document(
+            request.question,
+            llm=get_llm_from_config(db),
+            embedding_function=get_embeddings_from_config(db),
+        )
 
         return RagResponse(
             answer=answer,
@@ -281,7 +347,26 @@ def _chunk_text(chunk) -> str:
     return "".join(text_parts)
 
 
-async def _stream_chat_text(model_input: str) -> AsyncIterator[str]:
+def _last_assistant_text(messages: list) -> str:
+    for message in reversed(messages):
+        if getattr(message, "type", None) == "ai":
+            text = _chunk_text(message)
+            if text:
+                return text
+    return ""
+
+
+def _tools_used(messages: list) -> list[str]:
+    names: list[str] = []
+    for message in messages:
+        for tool_call in getattr(message, "tool_calls", []) or []:
+            name = tool_call.get("name")
+            if isinstance(name, str) and name not in names:
+                names.append(name)
+    return names
+
+
+async def _stream_chat_text(model_input: str, chat_chain) -> AsyncIterator[str]:
     """流式读取模型文本；上游未返回分片时降级为一次性异步调用。"""
 
     received_text = False

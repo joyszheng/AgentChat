@@ -69,6 +69,11 @@ class ChatSession(Base):
         nullable=False,
     )
     last_message_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        index=True,
+    )
 
     messages: Mapped[list["ChatMessage"]] = relationship(
         back_populates="session",
@@ -110,6 +115,45 @@ class SystemSetting(Base):
     category: Mapped[str] = mapped_column(String(50), nullable=False, index=True)
     is_encrypted: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     description: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class MCPServer(Base):
+    """Registered remote MCP server and its local exposure policy."""
+
+    __tablename__ = "mcp_servers"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
+    description: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    transport: Mapped[str] = mapped_column(
+        String(30), default="streamable_http", nullable=False
+    )
+    url: Mapped[str] = mapped_column(String(1000), nullable=False)
+    headers_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    require_admin: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    allowed_tools: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    discovered_tools: Mapped[list[str]] = mapped_column(JSON, default=list, nullable=False)
+    call_timeout_seconds: Mapped[int] = mapped_column(Integer, default=20, nullable=False)
+    max_result_chars: Mapped[int] = mapped_column(Integer, default=20000, nullable=False)
+    last_health_status: Mapped[str] = mapped_column(
+        String(30), default="unknown", nullable=False, index=True
+    )
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

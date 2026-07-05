@@ -11,9 +11,9 @@ from langchain_milvus import Milvus
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pymilvus import MilvusClient, connections
 
-from .chains import rag_chain
+from .chains import create_rag_chain
 from .document_processing import ProcessedDocument, load_upload_documents
-from .models import embeddings
+from .models import embeddings as default_embeddings
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -54,6 +54,7 @@ if AGENTCHAT_MILVUS_URI.endswith(".db"):
     Path(AGENTCHAT_MILVUS_URI).parent.mkdir(parents=True, exist_ok=True)
 
 vector_store: Milvus | None = None
+vector_store_embedding = None
 default_documents_indexed = False
 
 
@@ -77,8 +78,14 @@ def _ensure_legacy_orm_connection(connection_args: dict[str, str]) -> None:
         connections.connect(alias=client._using, **connection_args)
 
 
-def get_vector_store() -> Milvus:
-    global vector_store
+def get_vector_store(embedding_function=None) -> Milvus:
+    global default_documents_indexed, vector_store, vector_store_embedding
+
+    selected_embedding = embedding_function or default_embeddings
+    if vector_store_embedding is not selected_embedding:
+        vector_store = None
+        vector_store_embedding = selected_embedding
+        default_documents_indexed = False
 
     if vector_store is None:
         started_at = time.perf_counter()
@@ -91,7 +98,7 @@ def get_vector_store() -> Milvus:
             connection_args = _milvus_connection_args()
             _ensure_legacy_orm_connection(connection_args)
             vector_store = Milvus(
-                embedding_function=embeddings,
+                embedding_function=selected_embedding,
                 collection_name=AGENTCHAT_MILVUS_COLLECTION,
                 connection_args=connection_args,
                 auto_id=False,
@@ -136,8 +143,10 @@ def _upsert_documents(
     documents: list[Document],
     *,
     document_id: int | None = None,
+    embedding_function=None,
 ) -> None:
-    store = get_vector_store()
+    selected_embedding = embedding_function or default_embeddings
+    store = get_vector_store(selected_embedding)
     ids = _chunk_ids(documents)
     started_at = time.perf_counter()
     scope = _log_scope(document_id)
@@ -154,7 +163,7 @@ def _upsert_documents(
         operation,
         len(documents),
         total_characters,
-        getattr(embeddings, "dimensions", "provider_default"),
+        getattr(selected_embedding, "dimensions", "provider_default"),
     )
 
     try:
@@ -195,14 +204,17 @@ def _upsert_documents(
     )
 
 
-def ensure_default_documents_indexed() -> None:
+def ensure_default_documents_indexed(embedding_function=None) -> None:
     global default_documents_indexed
 
+    # Let get_vector_store invalidate the default-document flag when the
+    # administrator switches to a different embedding configuration.
+    get_vector_store(embedding_function)
     if default_documents_indexed:
         return
 
     logger.info("[rag] Default document indexing started documents=%s", len(chunks))
-    _upsert_documents(chunks)
+    _upsert_documents(chunks, embedding_function=embedding_function)
     default_documents_indexed = True
     logger.info("[rag] Default document indexing completed documents=%s", len(chunks))
 
@@ -212,6 +224,7 @@ def add_documents_to_index(
     *,
     document_id: int | None = None,
     progress_callback: ProgressCallback | None = None,
+    embedding_function=None,
 ) -> int:
     """Split cleaned documents and add them to the Milvus vector store."""
 
@@ -246,8 +259,12 @@ def add_documents_to_index(
     if progress_callback is not None:
         progress_callback("indexing", chunk_count=len(chunks))
 
-    ensure_default_documents_indexed()
-    _upsert_documents(chunks, document_id=document_id)
+    ensure_default_documents_indexed(embedding_function)
+    _upsert_documents(
+        chunks,
+        document_id=document_id,
+        embedding_function=embedding_function,
+    )
     return len(chunks)
 
 
@@ -311,6 +328,7 @@ def ingest_upload(
     content_type: str | None = None,
     document_id: int | None = None,
     progress_callback: ProgressCallback | None = None,
+    embedding_function=None,
 ) -> tuple[ProcessedDocument, int]:
     started_at = time.perf_counter()
     scope = _log_scope(document_id)
@@ -352,6 +370,7 @@ def ingest_upload(
         processed.documents,
         document_id=document_id,
         progress_callback=progress_callback,
+        embedding_function=embedding_function,
     )
     logger.info(
         "[%s] Ingestion pipeline completed file=%r documents=%s chunks=%s "
@@ -366,7 +385,8 @@ def ingest_upload(
     return processed, chunk_count
 
 
-def _generate_answer(*, context: str, question: str) -> str:
+def _generate_answer(*, context: str, question: str, llm) -> str:
+    rag_chain = create_rag_chain(llm)
     for _ in range(2):
         response = rag_chain.invoke({
             "context": context,
@@ -378,9 +398,9 @@ def _generate_answer(*, context: str, question: str) -> str:
     raise RuntimeError("RAG model returned an empty response")
 
 
-def ask_document(question: str) -> tuple[str, list[str]]:
-    ensure_default_documents_indexed()
-    retriever = get_vector_store().as_retriever(search_kwargs={"k": 4})
+def ask_document(question: str, *, llm, embedding_function=None) -> tuple[str, list[str]]:
+    ensure_default_documents_indexed(embedding_function)
+    retriever = get_vector_store(embedding_function).as_retriever(search_kwargs={"k": 4})
     documents = retriever.invoke(question)
 
     context = "\n\n".join(
@@ -388,7 +408,7 @@ def ask_document(question: str) -> tuple[str, list[str]]:
         for doc in documents
     )
 
-    answer = _generate_answer(context=context, question=question)
+    answer = _generate_answer(context=context, question=question, llm=llm)
 
     sources = sorted({
         doc.metadata.get("original_filename") or doc.metadata.get("source", "未知来源")

@@ -1,18 +1,30 @@
 # AgentChat
 
-AgentChat 是一个用于学习 FastAPI、SQLAlchemy 与 LangChain 的 AI 任务助手后端。
+AgentChat 是一个前后端分离的 AI 对话与知识库应用。后端基于 FastAPI、SQLAlchemy、LangChain 和 Milvus，前端基于 Next.js、React、Ant Design X 与 Tailwind CSS。
 
-## 已实现功能
+项目目前提供流式 AI 对话、会话历史、文档上传与向量化、RAG 知识库问答、任务助手、JWT 登录，以及管理员系统配置页面。
 
-- 任务的创建、查询、更新和删除
-- 普通 AI 聊天
-- 多轮聊天会话与历史消息持久化
-- AI 查询未完成任务
-- AI 创建任务
-- 基于固定文档和上传文档的 RAG 问答
-- 文件上传、文本解析、清洗与 RAG 入库
-- pytest 接口与异常测试
-- 文档处理完成邮件通知
+## 功能概览
+
+- AI 对话：SSE 流式输出，保存会话和消息，生成回答时读取最近 10 条历史消息
+- 知识库问答：检索 Milvus 中的相关文档分片，并返回回答与来源
+- 文档管理：上传、解析、索引、进度展示、下载和删除 PDF、DOCX、Markdown、TXT
+- 任务管理：任务 CRUD，以及可查询待办、创建任务的 LangChain Agent
+- 用户认证：JWT 登录、当前用户查询、管理员权限校验
+- 系统配置：管理员维护 AI、邮件、通知和向量库配置，敏感值加密存储并脱敏展示
+- 邮件通知：文档索引成功或失败后发送处理结果通知
+- 响应式前端：桌面侧栏与移动端底部导航，支持普通对话和 RAG 模式切换
+
+## 技术栈
+
+| 层级 | 技术 |
+| --- | --- |
+| 前端 | Next.js 16、React 19、TypeScript、Ant Design 6、Ant Design X、Tailwind CSS 4、Axios |
+| 后端 | Python 3.11–3.13、FastAPI、SQLAlchemy 2、Pydantic |
+| AI | LangChain、OpenAI 兼容的 Chat Completions / Embeddings API |
+| 数据 | PostgreSQL 或 SQLite、Milvus |
+| 认证与安全 | JWT、bcrypt、Fernet 加密 |
+| 工程化 | uv、pytest、Ruff、npm / pnpm、ESLint |
 
 ## 项目结构
 
@@ -20,346 +32,271 @@ AgentChat 是一个用于学习 FastAPI、SQLAlchemy 与 LangChain 的 AI 任务
 AgentChat/
 ├─ backend/
 │  ├─ app/
-│  │  ├─ ai/
-│  │  │  ├─ models.py      # LLM 初始化
-│  │  │  ├─ prompts.py     # Prompt 模板
-│  │  │  ├─ chains.py      # Chain 组装
-│  │  │  ├─ tools.py       # 任务工具
-│  │  │  ├─ agents.py      # Agent 组装
-│  │  │  ├─ document_processing.py # 上传文档解析与清洗
-│  │  │  └─ rag.py         # 文档检索、切分与索引
-│  │  ├─ routers/
-│  │  │  ├─ ai.py          # AI 接口
-│  │  │  └─ tasks.py       # 任务接口
-│  │  └─ main.py           # FastAPI 应用入口
-│  ├─ docs/                 # RAG 示例文档
-│  ├─ tests/                # pytest 测试
-│  └─ pytest.ini
-└─ docs/                    # 学习计划与笔记
+│  │  ├─ ai/                 # 模型、Prompt、Chain、Agent、RAG 与文档解析
+│  │  ├─ routers/            # AI、任务、认证和系统配置路由
+│  │  ├─ services/           # 认证、配置、加密和邮件服务
+│  │  ├─ crud.py             # 数据访问操作
+│  │  ├─ database.py         # SQLAlchemy 引擎与会话
+│  │  ├─ models.py           # ORM 模型
+│  │  ├─ schemas.py          # API 数据模型
+│  │  └─ main.py             # FastAPI 应用入口与文档接口
+│  ├─ docs/                  # 启动时可加入 RAG 的内置示例文档
+│  ├─ tests/                 # pytest 测试
+│  ├─ .env.example           # 后端环境变量示例
+│  └─ pyproject.toml         # Python 依赖与工具配置
+├─ frontend/
+│  ├─ src/app/               # chat、knowledge、login、settings 页面
+│  ├─ src/components/        # 全局布局等组件
+│  ├─ src/lib/               # HTTP 客户端与认证工具
+│  └─ package.json
+└─ docs/                     # 学习计划与代码笔记
 ```
 
-## 安装与配置
+## 本地运行
 
-项目使用 `uv` 统一管理 Python、虚拟环境、依赖和锁文件。Windows 可使用官方脚本安装：
+### 1. 环境要求
 
-```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-```
+- Python 3.11–3.13；仓库的 `.python-version` 当前指定 Python 3.12
+- [uv](https://docs.astral.sh/uv/)
+- Node.js 20 或更高版本
+- 可访问的 OpenAI 兼容模型服务
+- Milvus 服务，默认地址为 `http://localhost:19530`
+- PostgreSQL（可选；未配置时使用 SQLite）
 
-进入后端目录并同步完整开发环境：
+### 2. 配置并启动后端
 
 ```powershell
 cd backend
+Copy-Item .env.example .env
 uv sync --extra ai
 ```
 
-`uv` 会根据 `.python-version` 准备 Python 3.11、创建 `.venv`，并在首次同步时生成 `uv.lock`。普通 Web 与数据库依赖位于基础依赖组，LangChain、线上模型客户端、文档解析等依赖位于 `ai` 可选组，pytest、ruff 等开发工具位于 `dev` 组。当前应用启动时会注册 AI 路由，因此运行完整服务必须带上 `--extra ai`。
-
-创建 `backend/.env`：
+编辑 `backend/.env`，最小可用配置如下：
 
 ```env
-GLM_API_KEY=你的API密钥
-DATABASE_URL=postgresql+psycopg://postgres:你的PostgreSQL密码@localhost:5432/postgres
+# OpenAI 兼容的模型服务
+LLM_API_KEY=your-api-key
+AI_BASE_URL=https://your-provider.example/v1
+AI_MODEL=your-chat-model
+EMBEDDING_MODEL=your-embedding-model
+AGENTCHAT_EMBEDDING_DIMENSIONS=1024
+
+# Milvus
 AGENTCHAT_MILVUS_URI=http://localhost:19530
 AGENTCHAT_MILVUS_COLLECTION=agentchat_documents
-AGENTCHAT_EMBEDDING_DIMENSIONS=1024
-# 如果 Milvus 开启鉴权，再配置：
-# AGENTCHAT_MILVUS_TOKEN=root:Milvus
-# AGENTCHAT_MILVUS_DB=default
 
-# 邮件通知配置（可选）
-SMTP_HOST=smtp.qq.com
-SMTP_PORT=465
-SMTP_USER=你的QQ邮箱地址
-SMTP_PASSWORD=你的QQ邮箱授权码
-SMTP_FROM_EMAIL=你的QQ邮箱地址
-SMTP_FROM_NAME=AgentChat通知系统
-SMTP_ENABLED=true
+# 请在正式或需要持久登录的环境中固定这两个密钥
+JWT_SECRET_KEY=replace-with-a-long-random-secret
+ENCRYPTION_KEY=replace-with-a-fernet-key
 ```
 
-不要将真实 API Key 或数据库密码提交到版本控制。未配置 `DATABASE_URL` 时，后端会回退使用本地 SQLite 文件 `backend/test.db`。
+`ENCRYPTION_KEY` 必须是合法的 Fernet 密钥，可以在依赖安装后生成：
 
-### 邮件通知配置（可选）
+```powershell
+uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
 
-项目支持在文档处理完成后发送邮件通知。当前通知接收地址配置在 `backend/app/main.py` 的 `DOCUMENT_NOTIFICATION_EMAIL` 常量中。
-
-**QQ 邮箱配置步骤：**
-
-1. 登录 QQ 邮箱网页版，进入「设置」→「账户」
-2. 找到「POP3/IMAP/SMTP/Exchange/CardDAV/CalDAV服务」
-3. 开启「IMAP/SMTP服务」或「POP3/SMTP服务」
-4. 点击「生成授权码」，按提示完成验证
-5. 将生成的授权码填入 `.env` 的 `SMTP_PASSWORD` 字段
-
-**注意**：`SMTP_PASSWORD` 填写的是授权码，不是 QQ 密码。
-
-如果不需要邮件通知，可以将 `SMTP_ENABLED` 设为 `false`，或不配置 `SMTP_USER` 和 `SMTP_PASSWORD`。
-
-邮件通知内容包括：
-- 文件名和文件大小
-- 上传时间
-- 处理状态（成功/失败）
-- 文档数量和文本分片数
-- 警告信息或错误信息
-
-## 启动服务
-
-在 `backend` 目录运行：
+启动 FastAPI：
 
 ```powershell
 uv run fastapi dev app/main.py
 ```
 
-启动后可访问：
+后端默认地址：
 
-- 服务地址：`http://127.0.0.1:8000`
-- Swagger 文档：`http://127.0.0.1:8000/docs`
+- API：<http://127.0.0.1:8000>
+- Swagger UI：<http://127.0.0.1:8000/docs>
+- OpenAPI JSON：<http://127.0.0.1:8000/openapi.json>
 
-## API
+首次启动且用户表为空时，后端会创建管理员。默认账号为 `admin` / `admin123`。建议在第一次启动前通过以下变量改掉默认值：
 
-| 方法 | 路径 | 功能 |
-|---|---|---|
-| GET | `/` | 服务存活检查 |
-| GET | `/tasks` | 查询任务列表 |
-| POST | `/tasks` | 创建任务 |
-| GET | `/tasks/{task_id}` | 查询单个任务 |
-| PUT | `/tasks/{task_id}` | 完整更新任务 |
-| PATCH | `/tasks/{task_id}` | 部分更新任务 |
-| DELETE | `/tasks/{task_id}` | 删除任务 |
-| POST | `/upload` | 上传文件 |
-| GET | `/documents` | 查询上传文档记录 |
-| POST | `/ai/sessions` | 创建聊天会话 |
-| GET | `/ai/sessions` | 查询聊天会话列表 |
-| GET | `/ai/sessions/{session_id}/messages` | 查询会话消息 |
-| POST | `/ai/chat` | 普通 AI 聊天 |
-| POST | `/ai/tasks-assistant` | AI 查询或创建任务 |
-| POST | `/ai/rag` | 基于文档问答 |
-
-### 普通聊天
-
-请求：
-
-```json
-{
-  "message": "什么是 LangChain？",
-  "session_id": 1
-}
+```env
+DEFAULT_ADMIN_USERNAME=admin
+DEFAULT_ADMIN_PASSWORD=replace-with-a-strong-password
+DEFAULT_ADMIN_EMAIL=admin@example.com
 ```
 
-`session_id` 可选；不传时后端会自动创建新会话，传入时会继续该会话。聊天时会读取当前会话最近 10 条历史消息，并与 `chat_sessions.summary` 一起组成上下文传给模型。
-
-响应：
-
-```json
-{
-  "answer": "LangChain 是一个用于构建 LLM 应用的开发框架。",
-  "session_id": 1,
-  "user_message_id": 10,
-  "assistant_message_id": 11
-}
-```
-
-### 多轮会话
-
-创建会话：
-
-```http
-POST /ai/sessions
-```
-
-```json
-{
-  "title": "AgentChat 开发讨论",
-  "mode": "chat"
-}
-```
-
-查询会话列表：
-
-```http
-GET /ai/sessions?skip=0&limit=20
-```
-
-查询会话消息：
-
-```http
-GET /ai/sessions/1/messages?skip=0&limit=50
-```
-
-会话和消息分别保存到数据库表 `chat_sessions` 与 `chat_messages`。`chat_sessions.summary` 已预留为长期摘要记忆字段；当前版本会持久化完整消息历史，并在回答时使用最近 10 条历史消息，自动摘要压缩将在后续版本实现。
-
-### 任务助手
-
-请求：
-
-```json
-{
-  "message": "查询前 3 条未完成任务"
-}
-```
-
-也可以要求 Agent 创建任务：
-
-```json
-{
-  "message": "帮我创建任务：复习 LangChain 测试"
-}
-```
-
-### RAG 文档问答
-
-请求：
-
-```json
-{
-  "question": "AgentChat 项目的内部代号是什么？"
-}
-```
-
-当前 RAG 启动时会索引固定文档 `backend/docs/agentchat-guide.md`。上传 `.pdf`、`.docx`、`.md`、`.txt` 文件后，后端会使用 `unstructured` 提取文本，清洗后切分为 chunk，并加入 Milvus 向量索引。
-
-向量库使用 Milvus 服务模式，默认连接 `http://localhost:19530`，集合名为 `agentchat_documents`。可以用 Attu 查看集合、schema 和数据：
-
-- Attu 桌面版连接：`localhost:19530`
-- Attu Docker 连接宿主机 Milvus：`host.docker.internal:19530`
-- Attu 与 Milvus 在同一 Docker 网络：`milvus:19530`
-
-如果 Milvus 开启鉴权，在 `.env` 中配置 `AGENTCHAT_MILVUS_TOKEN`；如果使用非默认数据库，配置 `AGENTCHAT_MILVUS_DB`。
-
-### 文件上传与入库
-
-`/upload` 会保存原始文件并返回 `202 Accepted`，随后在后台解析文本并自动加入 RAG 索引。当前支持：
-
-- `.pdf`
-- `.docx`
-- `.md`
-- `.txt`
-
-请求使用 `multipart/form-data` 上传文件字段 `file`。
-
-接收成功响应示例：
-
-```json
-{
-  "document_id": 1,
-  "filename": "3f2b...c9.pdf",
-  "original_filename": "制度文件.pdf",
-  "content_type": "application/pdf",
-  "size": 12345,
-  "saved_to": "D:\\project\\AgentChat\\backend\\uploads\\3f2b...c9.pdf",
-  "indexed": false,
-  "status": "processing",
-  "document_count": 0,
-  "chunk_count": 0,
-  "warnings": [],
-  "message": "文件上传成功，正在后台解析并加入 RAG 索引"
-}
-```
-
-客户端可通过 `GET /documents` 查询后台处理结果。状态会从 `processing` 变为 `indexed`；解析或入库失败时变为 `failed`，具体原因记录在 `error_message`。
-
-后台处理进度会输出到 FastAPI 服务终端，日志前缀包括 `[upload:<文档ID>]`、`[document]` 和 `[rag]`，可据此判断当前处于文件解析、文本切块、Embedding 或 Milvus 写入阶段，并查看各阶段耗时。
-
-PDF 当前使用轻量 `pypdf` 解析，只处理可以直接提取文本的 PDF；扫描件 PDF 暂不启用 OCR，若未提取到可用文本，后台记录会标记为 `failed`。DOCX、Markdown 和 TXT 仍由 `unstructured` 处理。
-
-上传文件会写入数据库表 `uploaded_documents`，记录原文件名、服务端文件名、保存路径、文件大小、解析状态、chunk 数、文件 hash、错误信息和创建/更新时间。当前开发阶段启动时会调用 SQLAlchemy 自动建表；生产环境建议改用 Alembic 等迁移工具。文档 chunk 和向量写入 Milvus，不存入 PostgreSQL。
-
-### 上传文档记录
-
-查询上传文档记录：
-
-```http
-GET /documents?skip=0&limit=20
-```
-
-响应字段包含：
-
-```json
-[
-  {
-    "id": 1,
-    "original_filename": "制度文件.pdf",
-    "stored_filename": "3f2b...c9.pdf",
-    "content_type": "application/pdf",
-    "file_ext": ".pdf",
-    "size_bytes": 12345,
-    "saved_to": "D:\\project\\AgentChat\\backend\\uploads\\3f2b...c9.pdf",
-    "status": "indexed",
-    "document_count": 12,
-    "chunk_count": 38,
-    "file_sha256": "...",
-    "warnings": [],
-    "error_message": null,
-    "created_at": "2026-06-30T10:00:00",
-    "updated_at": "2026-06-30T10:00:03"
-  }
-]
-```
-
-## 运行测试
-
-在 `backend` 目录运行全部测试：
+### 3. 配置并启动前端
 
 ```powershell
-uv run pytest tests -v -s
+cd frontend
+npm install
 ```
 
-只运行 AI 测试：
+创建 `frontend/.env.local`：
+
+```env
+NEXT_PUBLIC_API_URL=http://127.0.0.1:8000
+NEXT_PUBLIC_API_BASE_URL=http://127.0.0.1:8000
+```
+
+当前代码中，登录页读取 `NEXT_PUBLIC_API_BASE_URL`，其他页面读取 `NEXT_PUBLIC_API_URL`，因此二者应配置为同一个后端地址。
+
+启动开发服务器：
 
 ```powershell
-uv run pytest tests/test_ai.py -v -s
+npm run dev
 ```
 
-## 依赖维护
+浏览器访问 <http://localhost:3000>。根路径会自动跳转到 `/chat`。
 
-在 `backend` 目录使用以下命令维护依赖，不要直接执行 `pip install` 修改项目环境：
+### 4. 生产构建
 
 ```powershell
-# 添加运行依赖
-uv add pydantic-settings
-
-# 添加 PostgreSQL 驱动
-uv add "psycopg[binary]"
-
-# 添加 AI 可选依赖
-uv add --optional ai langchain-community
-
-# 添加 Milvus 向量库依赖
-uv add pymilvus langchain-milvus
-
-# 添加文档解析依赖（不启用 OCR）
-uv add --optional ai unstructured pdfminer-six python-docx markdown
-
-# 添加开发依赖
-uv add --dev pytest-cov
-
-# 只升级一个包，减少批量升级风险
-uv lock --upgrade-package langchain
-
-# 查看完整依赖树
-uv tree
+cd frontend
+npm run build
+npm run start
 ```
 
-修改依赖后应同时提交 `pyproject.toml` 和 `uv.lock`。CI 或部署环境建议使用 `uv sync --locked --extra ai --no-dev`，确保锁文件与项目声明一致。
+后端生产部署时应使用固定的 `JWT_SECRET_KEY` 和 `ENCRYPTION_KEY`，配置 PostgreSQL，并用数据库迁移工具替代当前的启动时自动建表。
 
-测试覆盖真实模型调用、请求参数校验，以及使用 `monkeypatch` 模拟的模型、Agent 和 RAG 异常。
+## 环境变量
 
-RAG 使用 OpenAI 兼容 embedding 接口，地址和密钥复用 `backend/app/ai/models.py` 中的 `AI_BASE_URL` 与 `GLM_API_KEY`，embedding 模型为 `baai/bge-m3`。运行 RAG 前需要确保 `.env` 中已配置可用的 `GLM_API_KEY`。
+### 后端
 
-## 技术栈
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `DATABASE_URL` | `sqlite:///./test.db` | SQLAlchemy 数据库地址 |
+| `LLM_API_KEY` | 空 | OpenAI 兼容 API 密钥 |
+| `AI_BASE_URL` | `https://ai.hybgzs.com/v1` | 模型 API 基础地址 |
+| `AI_MODEL` | `moonshotai/kimi-k2.6` | 对话模型名称 |
+| `EMBEDDING_MODEL` | `Qwen/Qwen3-Embedding-8B` | Embedding 模型名称 |
+| `AGENTCHAT_EMBEDDING_DIMENSIONS` | `1024` | Embedding 向量维度，必须与模型及 Milvus 集合一致 |
+| `AGENTCHAT_MILVUS_URI` | `http://localhost:19530` | Milvus 服务地址；也支持以 `.db` 结尾的 Milvus Lite 地址 |
+| `AGENTCHAT_MILVUS_COLLECTION` | `agentchat_documents` | Milvus 集合名 |
+| `AGENTCHAT_MILVUS_TOKEN` | 空 | Milvus 鉴权令牌 |
+| `AGENTCHAT_MILVUS_DB` | 空 | Milvus 数据库名 |
+| `AGENTCHAT_VECTOR_TIMEOUT_SECONDS` | `60` | 向量操作超时秒数 |
+| `JWT_SECRET_KEY` | 启动时随机生成 | JWT 签名密钥；随机值会导致重启后旧令牌失效 |
+| `JWT_ALGORITHM` | `HS256` | JWT 签名算法 |
+| `JWT_ACCESS_TOKEN_EXPIRE_MINUTES` | `43200` | 访问令牌有效期，默认 30 天 |
+| `ENCRYPTION_KEY` | 启动时随机生成 | 系统敏感配置加密密钥；随机值会导致重启后旧密文无法解密 |
+| `DEFAULT_ADMIN_USERNAME` | `admin` | 首次初始化的管理员用户名 |
+| `DEFAULT_ADMIN_PASSWORD` | `admin123` | 首次初始化的管理员密码 |
+| `DEFAULT_ADMIN_EMAIL` | `admin@agentchat.local` | 首次初始化的管理员邮箱 |
 
-- FastAPI
-- SQLAlchemy、PostgreSQL 与 SQLite 回退
-- LangChain
-- Milvus
-- OpenAI 兼容模型接口
-- OpenAI 兼容 Embeddings
-- unstructured 文档解析
-- pytest
+邮件通知还支持以下变量：
+
+```env
+SMTP_ENABLED=false
+SMTP_HOST=smtp.qq.com
+SMTP_PORT=465
+SMTP_USER=sender@example.com
+SMTP_PASSWORD=mail-authorization-code
+SMTP_FROM_EMAIL=sender@example.com
+SMTP_FROM_NAME=AgentChat通知系统
+```
+
+通知接收地址可由管理员页面中的 `document_notification_email` 配置。QQ 邮箱应填写授权码，而不是登录密码。
+
+### 前端
+
+| 变量 | 代码默认值 | 使用位置 |
+| --- | --- | --- |
+| `NEXT_PUBLIC_API_URL` | `http://127.0.0.1:8000` | 对话、知识库和系统设置 |
+| `NEXT_PUBLIC_API_BASE_URL` | `http://localhost:8000` | 登录页 |
+
+## 使用说明
+
+### AI 对话
+
+前端 `/chat` 提供两种模式：
+
+- 普通对话：调用 `POST /ai/chat/stream`，通过 SSE 逐段显示回答，并持久化会话和消息
+- RAG 问答：调用 `POST /ai/rag`，检索知识库并展示来源
+
+普通对话会读取会话最近 10 条消息和 `chat_sessions.summary` 作为上下文。当前会持久化完整历史，但尚未自动生成长期摘要。
+
+### 文档知识库
+
+前端 `/knowledge` 支持上传 `.pdf`、`.docx`、`.md` 和 `.txt`。后端处理流程为：
+
+1. 保存原始文件并创建 `uploaded_documents` 记录
+2. 在 FastAPI 后台任务中解析和清洗文本
+3. 以 600 字符、100 字符重叠切分文档
+4. 生成 Embedding 并写入 Milvus
+5. 通过 SSE 接口推送 `parsing`、`chunking`、`indexing` 等进度
+6. 根据配置发送成功或失败邮件
+
+PDF 使用 `pypdf` 提取文本，不包含 OCR；扫描件若没有可提取文本会处理失败。TXT 和 Markdown 支持 UTF-8、GB18030 编码，DOCX 由 `python-docx` 解析。
+
+删除文档需要登录。对于已经索引的文档，后端会先删除 Milvus 分片，再删除本地文件和数据库记录；处理中的文档不能删除。
+
+### 系统设置
+
+管理员登录后可以访问 `/settings`。敏感配置（例如 API Key、SMTP 密码）使用 Fernet 加密保存，接口返回时会脱敏。
+
+当前实现中：
+
+- 邮件与通知配置会在发送邮件时从数据库读取
+- 聊天、任务助手和 RAG 生成模型会在每次请求时优先读取数据库配置，未配置时回退到 `backend/.env`
+- 后台保存 LLM 配置后，下一次 AI 请求立即生效；Embedding 和 Milvus 客户端仍在进程启动时初始化，修改向量配置后需要重启后端
+
+## API 概览
+
+| 方法 | 路径 | 说明 | 权限 |
+| --- | --- | --- | --- |
+| `GET` | `/` | 存活检查 | 公开 |
+| `POST` | `/auth/login` | 登录并获取 JWT | 公开 |
+| `GET` | `/auth/me` | 查询当前用户 | 可选登录 |
+| `POST` | `/auth/logout` | 登出提示；令牌由客户端清除 | 登录 |
+| `GET/POST` | `/tasks` | 查询或创建任务 | 公开 |
+| `GET/PUT/PATCH/DELETE` | `/tasks/{task_id}` | 查询、更新或删除任务 | 公开 |
+| `GET/POST` | `/ai/sessions` | 查询或创建聊天会话 | 公开 |
+| `DELETE` | `/ai/sessions/{session_id}` | 软删除会话（保留消息用于审计） | 公开 |
+| `GET` | `/ai/sessions/{session_id}/messages` | 查询会话消息 | 公开 |
+| `POST` | `/ai/chat` | 非流式普通对话 | 公开 |
+| `POST` | `/ai/chat/stream` | SSE 流式普通对话 | 公开 |
+| `POST` | `/ai/tasks-assistant` | AI 任务助手 | 公开 |
+| `POST` | `/ai/rag` | RAG 文档问答 | 公开 |
+| `POST` | `/upload` | 上传并后台索引文档 | 公开 |
+| `GET` | `/documents` | 查询文档记录 | 公开 |
+| `GET` | `/documents/{id}/progress` | SSE 文档处理进度 | 公开 |
+| `GET` | `/documents/{id}/download` | 下载原始文档 | 公开 |
+| `DELETE` | `/documents/{id}` | 删除文档、文件和向量分片 | 登录 |
+| `GET/PUT/DELETE` | `/settings/{key}` | 查询、更新或删除配置 | 管理员 |
+| `GET` | `/settings` | 查询配置列表 | 管理员 |
+| `POST` | `/settings/batch` | 批量保存配置 | 管理员 |
+
+需要认证的接口使用 Bearer Token：
+
+```http
+Authorization: Bearer <access_token>
+```
+
+完整请求和响应结构以启动后的 Swagger UI 为准。
+
+## 测试与检查
+
+后端：
+
+```powershell
+cd backend
+uv run pytest tests -v
+uv run ruff check app tests
+```
+
+`tests/test_ai.py` 中包含真实模型和 RAG 集成请求，运行完整测试集前需准备有效的模型 API 与 Milvus；其余测试大量使用 monkeypatch 隔离外部服务。
+
+前端：
+
+```powershell
+cd frontend
+npm run lint
+npm run build
+```
 
 ## 当前限制
 
-- 需要先启动 Milvus 服务，默认地址为 `http://localhost:19530`
-- PDF 仅支持可提取文本的文档，扫描件 OCR 暂未启用
-- 多轮聊天已持久化消息历史，但长期摘要自动更新尚未实现
-- 尚未实现流式输出
+- 扫描版 PDF 暂不支持 OCR
+- 对话长期摘要字段已经预留，但不会自动更新
+- AI 与 Milvus 的数据库配置尚未动态接入已初始化的运行时实例
+- 除系统设置和文档删除外，多数业务 API 当前仍是公开接口，也没有按用户隔离会话、任务和文档
+- 文档后台处理使用 FastAPI 进程内任务，不适合直接作为高可靠任务队列
+- 开发阶段由 SQLAlchemy 自动建表，尚未接入 Alembic 数据库迁移
+
+## 数据与安全提示
+
+- 不要提交 `backend/.env`、`frontend/.env.local`、API Key、数据库密码或邮件授权码
+- `backend/uploads/`、SQLite 数据库和本地向量文件均为运行时数据，已在 `.gitignore` 中排除
+- 生产环境应限制 CORS 来源、启用 HTTPS、使用强密钥，并为当前公开业务接口补充认证和用户级数据隔离

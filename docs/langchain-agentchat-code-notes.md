@@ -34,7 +34,7 @@ backend/
 `.env`：
 
 ```env
-GLM_API_KEY=你的密钥
+LLM_API_KEY=你的密钥
 ```
 
 加载环境变量必须调用函数，不能漏掉括号：
@@ -57,7 +57,7 @@ load_dotenv
 model = ChatOpenAI(
     model="z-ai/glm-5.1",
     base_url="https://ai.hybgzs.com/v1",
-    api_key=os.environ["GLM_API_KEY"],
+    api_key=os.environ["LLM_API_KEY"],
     timeout=30,
 )
 ```
@@ -508,7 +508,7 @@ except Exception:
 
 ## 10. 常见报错速查
 
-### `KeyError: GLM_API_KEY`
+### `KeyError: LLM_API_KEY`
 
 检查：
 
@@ -599,7 +599,7 @@ sources = sorted({
 启动前：
 
 - [ ] 已激活 `.venv`
-- [ ] `.env` 中存在 `GLM_API_KEY`
+- [ ] `.env` 中存在 `LLM_API_KEY`
 - [ ] 从 `backend` 目录启动
 - [ ] `docs/agentchat-guide.md` 存在
 - [ ] `python -c "import torch"` 不报错
@@ -613,4 +613,3 @@ sources = sorted({
 - [ ] `/ai/rag` 对文档中不存在的信息不编造
 - [ ] 代码中没有硬编码 API Key
 - [ ] 模块顶层没有测试用的远程模型调用
-

@@ -41,10 +41,7 @@ body {
 .ant-sender input:focus,
 .ant-sender textarea:focus,
 .ant-sender input:focus-visible,
-.ant-sender textarea:focus-visible,
-.ant-input:focus-visible,
-textarea:focus,
-input:focus {
+.ant-sender textarea:focus-visible {
   outline: none !important;
 }
 
@@ -63,4 +60,3 @@ input:focus {
   border: 1px solid #e5e7eb !important;
   box-shadow: 0 1px 2px 0 rgba(0, 0, 0, 0.05) !important;
 }
-

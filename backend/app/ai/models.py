@@ -10,11 +10,18 @@ DEFAULT_AI_BASE_URL = "https://ai.hybgzs.com/v1"
 DEFAULT_AI_MODEL = "moonshotai/kimi-k2.6"
 DEFAULT_EMBEDDING_MODEL = "Qwen/Qwen3-Embedding-8B"
 
-AI_BASE_URL = os.getenv("AI_BASE_URL", DEFAULT_AI_BASE_URL)
-AI_API_KEY = os.environ.get("GLM_API_KEY", "")
-AI_MODEL = os.getenv("AI_MODEL", DEFAULT_AI_MODEL)
+LLM_BASE_URL = os.getenv("LLM_BASE_URL", os.getenv("AI_BASE_URL", DEFAULT_AI_BASE_URL))
+LLM_API_KEY = os.environ.get("LLM_API_KEY", "")
+LLM_MODEL = os.getenv("LLM_MODEL", os.getenv("AI_MODEL", DEFAULT_AI_MODEL))
+EMBEDDING_BASE_URL = os.getenv("EMBEDDING_BASE_URL", LLM_BASE_URL)
+EMBEDDING_API_KEY = os.getenv("EMBEDDING_API_KEY", LLM_API_KEY)
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL)
 EMBEDDING_DIMENSIONS = int(os.getenv("AGENTCHAT_EMBEDDING_DIMENSIONS", "1024"))
+
+# Backward-compatible aliases for modules that still import the former names.
+AI_BASE_URL = LLM_BASE_URL
+AI_API_KEY = LLM_API_KEY
+AI_MODEL = LLM_MODEL
 
 
 def get_llm(*, base_url: str | None = None, api_key: str | None = None, model: str | None = None):
@@ -29,9 +36,9 @@ def get_llm(*, base_url: str | None = None, api_key: str | None = None, model: s
         ChatOpenAI: LLM 实例
     """
     return ChatOpenAI(
-        model=model or AI_MODEL,
-        base_url=base_url or AI_BASE_URL,
-        api_key=api_key or AI_API_KEY,
+        model=model or LLM_MODEL,
+        base_url=base_url or LLM_BASE_URL,
+        api_key=api_key or LLM_API_KEY,
         timeout=30,
         max_retries=2,
     )
@@ -58,8 +65,8 @@ def get_embeddings(
     return OpenAIEmbeddings(
         model=model or EMBEDDING_MODEL,
         dimensions=dimensions or EMBEDDING_DIMENSIONS,
-        base_url=base_url or AI_BASE_URL,
-        api_key=api_key or AI_API_KEY,
+        base_url=base_url or EMBEDDING_BASE_URL,
+        api_key=api_key or EMBEDDING_API_KEY,
         timeout=30,
         max_retries=2,
         tiktoken_enabled=False,
@@ -67,6 +74,6 @@ def get_embeddings(
     )
 
 
-# 保持向后兼容：默认实例
-llm = get_llm()
+# Embeddings are still shared by the vector store. LLMs are created per request
+# so database settings saved by an administrator take effect immediately.
 embeddings = get_embeddings()
