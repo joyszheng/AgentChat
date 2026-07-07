@@ -2,7 +2,7 @@ import importlib
 import json
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 from fastapi.testclient import TestClient
 from langchain_core.documents import Document
@@ -185,6 +185,36 @@ def test_background_upload_records_document_processing_failure(monkeypatch, tmp_
     assert not Path(documents[0]["saved_to"]).exists()
 
 
+def test_upload_rejects_same_filename_and_same_content(monkeypatch, tmp_path):
+    main_module = _load_main_with_fake_rag(monkeypatch, tmp_path)
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir()
+    monkeypatch.setattr(main_module, "UPLOAD_DIR", upload_dir)
+
+    client = TestClient(main_module.app)
+    first_response = client.post(
+        "/upload",
+        files={"file": ("guide.md", b"# title\n\nbody", "text/markdown")},
+    )
+    duplicate_response = client.post(
+        "/upload",
+        files={"file": ("guide.md", b"# title\n\nbody", "text/markdown")},
+    )
+    renamed_response = client.post(
+        "/upload",
+        files={"file": ("guide-copy.md", b"# title\n\nbody", "text/markdown")},
+    )
+
+    assert first_response.status_code == 202
+    assert duplicate_response.status_code == 409
+    assert duplicate_response.json() == {
+        "detail": "同名且内容相同的文档已存在，请勿重复上传"
+    }
+    assert renamed_response.status_code == 202
+    assert len(client.get("/documents").json()) == 2
+    assert len(list(upload_dir.iterdir())) == 2
+
+
 def test_upload_rejects_unsupported_format_before_saving(monkeypatch, tmp_path):
     main_module = _load_main_with_fake_rag(monkeypatch, tmp_path)
     upload_dir = tmp_path / "uploads"
@@ -298,6 +328,7 @@ def _load_main_with_fake_rag(monkeypatch, tmp_path):
     database_url = f"sqlite:///{(tmp_path / 'test.db').as_posix()}"
     monkeypatch.setenv("DATABASE_URL", database_url)
     monkeypatch.setenv("LLM_API_KEY", "test-api-key")
+    monkeypatch.setenv("SMTP_ENABLED", "false")
     monkeypatch.setitem(sys.modules, "app.ai.rag", fake_rag)
     sys.modules.pop("app.crud", None)
     sys.modules.pop("app.database", None)
@@ -306,4 +337,8 @@ def _load_main_with_fake_rag(monkeypatch, tmp_path):
     sys.modules.pop("app.routers.ai", None)
     sys.modules.pop("app.main", None)
 
-    return importlib.import_module("app.main")
+    main_module = importlib.import_module("app.main")
+    main_module.app.dependency_overrides[main_module.require_auth] = (
+        lambda: SimpleNamespace(id=1, username="tester", role="admin")
+    )
+    return main_module

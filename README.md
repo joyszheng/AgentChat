@@ -1,19 +1,39 @@
 # AgentChat
 
-AgentChat 是一个前后端分离的 AI 对话与知识库应用。后端基于 FastAPI、SQLAlchemy、LangChain 和 Milvus，前端基于 Next.js、React、Ant Design X 与 Tailwind CSS。
+AgentChat 是一个前后端分离的 AI 对话、知识库与 MCP 工具接入应用。后端基于 FastAPI、SQLAlchemy、LangChain、LangChain MCP Adapters 和 Milvus，前端基于 Next.js、React、Ant Design X 与 Tailwind CSS。
 
-项目目前提供流式 AI 对话、会话历史、文档上传与向量化、RAG 知识库问答、任务助手、JWT 登录，以及管理员系统配置页面。
+项目目前提供流式 AI 对话、会话历史、文档上传与向量化、RAG 知识库问答、MCP 工具助手、任务助手、JWT 登录、管理员系统配置和 MCP Server 管理页面。
+
+## 界面示例
+
+### AI 问答
+
+![AI 问答页面](images/问答.png)
+
+### 知识库管理
+
+![知识库管理页面](images/知识库.png)
+
+### MCP 工具接入
+
+![MCP 工具接入页面](images/mcp接入.png)
+
+### 系统设置
+
+![系统设置页面](images/系统设置.png)
 
 ## 功能概览
 
 - AI 对话：SSE 流式输出，保存会话和消息，生成回答时读取最近 10 条历史消息
 - 知识库问答：检索 Milvus 中的相关文档分片，并返回回答与来源
+- MCP 工具助手：由管理员注册远程 Streamable HTTP MCP Server，模型可调用白名单内工具并在回答中展示工具调用记录
+- MCP 工具管理：支持添加、测试、启停、删除 MCP Server，配置认证 Header、工具白名单、调用超时和结果长度限制
 - 文档管理：上传、解析、索引、进度展示、下载和删除 PDF、DOCX、Markdown、TXT
 - 任务管理：任务 CRUD，以及可查询待办、创建任务的 LangChain Agent
 - 用户认证：JWT 登录、当前用户查询、管理员权限校验
-- 系统配置：管理员维护 AI、邮件、通知和向量库配置，敏感值加密存储并脱敏展示
+- 系统配置：管理员维护 LLM、Embedding、邮件、通知和向量库配置，敏感值加密存储并脱敏展示
 - 邮件通知：文档索引成功或失败后发送处理结果通知
-- 响应式前端：桌面侧栏与移动端底部导航，支持普通对话和 RAG 模式切换
+- 响应式前端：桌面侧栏与移动端底部导航，支持普通对话、知识库和 MCP 工具模式切换
 
 ## 技术栈
 
@@ -21,7 +41,7 @@ AgentChat 是一个前后端分离的 AI 对话与知识库应用。后端基于
 | --- | --- |
 | 前端 | Next.js 16、React 19、TypeScript、Ant Design 6、Ant Design X、Tailwind CSS 4、Axios |
 | 后端 | Python 3.11–3.13、FastAPI、SQLAlchemy 2、Pydantic |
-| AI | LangChain、OpenAI 兼容的 Chat Completions / Embeddings API |
+| AI | LangChain、LangChain MCP Adapters、OpenAI 兼容的 Chat Completions / Embeddings API |
 | 数据 | PostgreSQL 或 SQLite、Milvus |
 | 认证与安全 | JWT、bcrypt、Fernet 加密 |
 | 工程化 | uv、pytest、Ruff、npm / pnpm、ESLint |
@@ -33,6 +53,7 @@ AgentChat/
 ├─ backend/
 │  ├─ app/
 │  │  ├─ ai/                 # 模型、Prompt、Chain、Agent、RAG 与文档解析
+│  │  ├─ mcp/                # MCP Server 注册表与 LangChain 工具适配
 │  │  ├─ routers/            # AI、任务、认证和系统配置路由
 │  │  ├─ services/           # 认证、配置、加密和邮件服务
 │  │  ├─ crud.py             # 数据访问操作
@@ -45,10 +66,11 @@ AgentChat/
 │  ├─ .env.example           # 后端环境变量示例
 │  └─ pyproject.toml         # Python 依赖与工具配置
 ├─ frontend/
-│  ├─ src/app/               # chat、knowledge、login、settings 页面
+│  ├─ src/app/               # chat、knowledge、login、mcp、settings 页面
 │  ├─ src/components/        # 全局布局等组件
 │  ├─ src/lib/               # HTTP 客户端与认证工具
 │  └─ package.json
+├─ images/                   # README 页面示例截图
 └─ docs/                     # 学习计划与代码笔记
 ```
 
@@ -74,11 +96,15 @@ uv sync --extra ai
 编辑 `backend/.env`，最小可用配置如下：
 
 ```env
-# OpenAI 兼容的模型服务
-LLM_API_KEY=your-api-key
-AI_BASE_URL=https://your-provider.example/v1
-AI_MODEL=your-chat-model
+# OpenAI 兼容的 LLM 模型服务
+LLM_BASE_URL=https://your-provider.example/v1
+LLM_MODEL=your-chat-model
+LLM_API_KEY=your-llm-api-key
+
+# OpenAI 兼容的 Embedding 模型服务
+EMBEDDING_BASE_URL=https://your-provider.example/v1
 EMBEDDING_MODEL=your-embedding-model
+EMBEDDING_API_KEY=your-embedding-api-key
 AGENTCHAT_EMBEDDING_DIMENSIONS=1024
 
 # Milvus
@@ -157,10 +183,12 @@ npm run start
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `DATABASE_URL` | `sqlite:///./test.db` | SQLAlchemy 数据库地址 |
-| `LLM_API_KEY` | 空 | OpenAI 兼容 API 密钥 |
-| `AI_BASE_URL` | `https://ai.hybgzs.com/v1` | 模型 API 基础地址 |
-| `AI_MODEL` | `moonshotai/kimi-k2.6` | 对话模型名称 |
+| `LLM_BASE_URL` | `https://ai.hybgzs.com/v1` | LLM API 基础地址；兼容旧变量 `AI_BASE_URL` |
+| `LLM_MODEL` | `moonshotai/kimi-k2.6` | LLM 模型名称；兼容旧变量 `AI_MODEL` |
+| `LLM_API_KEY` | 空 | LLM API 密钥 |
+| `EMBEDDING_BASE_URL` | 跟随 `LLM_BASE_URL` | Embedding API 基础地址 |
 | `EMBEDDING_MODEL` | `Qwen/Qwen3-Embedding-8B` | Embedding 模型名称 |
+| `EMBEDDING_API_KEY` | 跟随 `LLM_API_KEY` | Embedding API 密钥 |
 | `AGENTCHAT_EMBEDDING_DIMENSIONS` | `1024` | Embedding 向量维度，必须与模型及 Milvus 集合一致 |
 | `AGENTCHAT_MILVUS_URI` | `http://localhost:19530` | Milvus 服务地址；也支持以 `.db` 结尾的 Milvus Lite 地址 |
 | `AGENTCHAT_MILVUS_COLLECTION` | `agentchat_documents` | Milvus 集合名 |
@@ -193,19 +221,31 @@ SMTP_FROM_NAME=AgentChat通知系统
 
 | 变量 | 代码默认值 | 使用位置 |
 | --- | --- | --- |
-| `NEXT_PUBLIC_API_URL` | `http://127.0.0.1:8000` | 对话、知识库和系统设置 |
+| `NEXT_PUBLIC_API_URL` | `http://127.0.0.1:8000` | 对话、知识库、MCP 工具和系统设置 |
 | `NEXT_PUBLIC_API_BASE_URL` | `http://localhost:8000` | 登录页 |
 
 ## 使用说明
 
 ### AI 对话
 
-前端 `/chat` 提供两种模式：
+前端 `/chat` 提供三种模式：
 
 - 普通对话：调用 `POST /ai/chat/stream`，通过 SSE 逐段显示回答，并持久化会话和消息
 - RAG 问答：调用 `POST /ai/rag`，检索知识库并展示来源
+- MCP 工具：调用 `POST /ai/mcp-assistant`，让模型在管理员允许的 MCP 工具范围内自主调用工具，并在回答下方展示工具名称
 
 普通对话会读取会话最近 10 条消息和 `chat_sessions.summary` 作为上下文。当前会持久化完整历史，但尚未自动生成长期摘要。
+
+### MCP 工具接入
+
+管理员登录后可以访问 `/mcp` 管理远程 Streamable HTTP MCP Server。页面支持：
+
+- 添加和编辑 MCP Server 名称、地址、说明、认证 Header、运行策略和工具白名单
+- 测试连接并发现远程工具，保存已发现工具列表和健康状态
+- 启用、停用、删除 MCP Server，以及手动重新加载运行时工具注册表
+- 统计已注册服务、健康服务、已启用服务和当前模型可用工具数量
+
+认证 Header 会在后端加密保存，接口只返回 Header 名称，不回显密钥值。启用的 MCP 工具会通过请求级 LangChain Agent 暴露给 `/ai/mcp-assistant`。
 
 ### 文档知识库
 
@@ -229,8 +269,10 @@ PDF 使用 `pypdf` 提取文本，不包含 OCR；扫描件若没有可提取文
 当前实现中：
 
 - 邮件与通知配置会在发送邮件时从数据库读取
-- 聊天、任务助手和 RAG 生成模型会在每次请求时优先读取数据库配置，未配置时回退到 `backend/.env`
-- 后台保存 LLM 配置后，下一次 AI 请求立即生效；Embedding 和 Milvus 客户端仍在进程启动时初始化，修改向量配置后需要重启后端
+- 聊天、任务助手、MCP 工具助手和 RAG 生成模型会在每次请求时优先读取数据库配置，未配置时回退到 `backend/.env`
+- 后台保存 LLM 配置后，下一次 AI 请求立即生效
+- Embedding 客户端按接口地址、模型、密钥和维度缓存；修改这些配置后，新请求会使用新的 Embedding 实例
+- Milvus 地址、集合、鉴权和数据库名仍在进程启动时读取，修改向量库连接配置后需要重启后端
 
 ## API 概览
 
@@ -248,6 +290,7 @@ PDF 使用 `pypdf` 提取文本，不包含 OCR；扫描件若没有可提取文
 | `POST` | `/ai/chat` | 非流式普通对话 | 公开 |
 | `POST` | `/ai/chat/stream` | SSE 流式普通对话 | 公开 |
 | `POST` | `/ai/tasks-assistant` | AI 任务助手 | 公开 |
+| `POST` | `/ai/mcp-assistant` | 可调用 MCP 工具的 AI 助手 | 公开 |
 | `POST` | `/ai/rag` | RAG 文档问答 | 公开 |
 | `POST` | `/upload` | 上传并后台索引文档 | 公开 |
 | `GET` | `/documents` | 查询文档记录 | 公开 |
@@ -257,6 +300,12 @@ PDF 使用 `pypdf` 提取文本，不包含 OCR；扫描件若没有可提取文
 | `GET/PUT/DELETE` | `/settings/{key}` | 查询、更新或删除配置 | 管理员 |
 | `GET` | `/settings` | 查询配置列表 | 管理员 |
 | `POST` | `/settings/batch` | 批量保存配置 | 管理员 |
+| `GET/POST` | `/mcp/servers` | 查询或注册 MCP Server | 管理员 |
+| `GET/PUT/DELETE` | `/mcp/servers/{server_id}` | 查询、更新或删除 MCP Server | 管理员 |
+| `POST` | `/mcp/servers/{server_id}/test` | 测试 MCP Server 并发现工具 | 管理员 |
+| `POST` | `/mcp/reload` | 重新加载运行时 MCP 工具注册表 | 管理员 |
+| `GET` | `/mcp/tools` | 查询已注册 MCP 工具 | 管理员 |
+| `POST` | `/mcp/tools/{qualified_name}/invoke` | 管理员手动调用 MCP 工具 | 管理员 |
 
 需要认证的接口使用 Bearer Token：
 
@@ -290,7 +339,7 @@ npm run build
 
 - 扫描版 PDF 暂不支持 OCR
 - 对话长期摘要字段已经预留，但不会自动更新
-- AI 与 Milvus 的数据库配置尚未动态接入已初始化的运行时实例
+- LLM 与 Embedding 配置已支持运行期读取；Milvus 连接配置仍需重启后端后生效
 - 除系统设置和文档删除外，多数业务 API 当前仍是公开接口，也没有按用户隔离会话、任务和文档
 - 文档后台处理使用 FastAPI 进程内任务，不适合直接作为高可靠任务队列
 - 开发阶段由 SQLAlchemy 自动建表，尚未接入 Alembic 数据库迁移

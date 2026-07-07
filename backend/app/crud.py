@@ -227,6 +227,22 @@ def get_uploaded_document(db: Session, document_id: int):
     return db.query(models.UploadedDocument).filter(models.UploadedDocument.id == document_id).first()
 
 
+def get_uploaded_document_by_name_hash(
+    db: Session,
+    *,
+    original_filename: str,
+    file_sha256: str,
+):
+    """查询是否已存在同名且内容完全相同的上传文件。"""
+
+    return (
+        db.query(models.UploadedDocument)
+        .filter(models.UploadedDocument.original_filename == original_filename)
+        .filter(models.UploadedDocument.file_sha256 == file_sha256)
+        .first()
+    )
+
+
 def list_uploaded_documents(db: Session, skip: int = 0, limit: int = 20):
     """按创建时间倒序查询上传文件记录。"""
 

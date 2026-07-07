@@ -2,7 +2,7 @@
 
 import React, { useState, useRef, useEffect } from 'react';
 import { Bubble, Sender, Conversations } from '@ant-design/x';
-import { message, Collapse, Tooltip, Popconfirm, Drawer, Segmented, Tag } from 'antd';
+import { message, Collapse, Tooltip, Popconfirm, Drawer, Select, Tag } from 'antd';
 import { PlusIcon, PanelLeftOpenIcon, PanelLeftCloseIcon, DeleteIcon } from 'lucide-animated';
 import http from '@/lib/http/axios';
 import ReactMarkdown from 'react-markdown';
@@ -47,7 +47,7 @@ interface MCPAssistantResponse {
 }
 
 const CHAT_MODE_OPTIONS: { label: string; value: ChatMode }[] = [
-  { label: '大模型', value: 'chat' },
+  { label: '大模型问答', value: 'chat' },
   { label: '知识库', value: 'rag' },
   { label: 'MCP 工具', value: 'mcp' },
 ];
@@ -98,6 +98,18 @@ export default function ChatPage() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [chatMode, setChatMode] = useState<ChatMode>('chat');
   const [isMobile, setIsMobile] = useState(false);
+
+  const chatModeSelect = (width = 128) => (
+    <Select<ChatMode>
+      aria-label="选择聊天模式"
+      size="middle"
+      value={chatMode}
+      options={CHAT_MODE_OPTIONS}
+      popupMatchSelectWidth={false}
+      style={{ width }}
+      onChange={setChatMode}
+    />
+  );
 
   useEffect(() => {
     const handleResize = () => {
@@ -440,12 +452,7 @@ export default function ChatPage() {
           </div>
           <div>
             {isMobile && (
-              <Segmented
-                size="small"
-                options={CHAT_MODE_OPTIONS}
-                value={chatMode}
-                onChange={(value) => setChatMode(value as ChatMode)}
-              />
+              chatModeSelect(124)
             )}
           </div>
         </div>
@@ -522,13 +529,8 @@ export default function ChatPage() {
           <Sender
             prefix={
               !isMobile ? (
-                <div className="flex items-center mr-2 mb-1 border-r border-gray-100 pr-3 relative -top-[1px]">
-                  <Segmented
-                    size="small"
-                    options={CHAT_MODE_OPTIONS}
-                    value={chatMode}
-                    onChange={(value) => setChatMode(value as ChatMode)}
-                  />
+                <div className="flex items-center mr-3 border-r border-gray-100 pr-3">
+                  {chatModeSelect()}
                 </div>
               ) : null
             }

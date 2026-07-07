@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, func
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, func
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -21,6 +21,13 @@ class UploadedDocument(Base):
     """上传文档表，记录文件保存、解析和入库状态。"""
 
     __tablename__ = "uploaded_documents"
+    __table_args__ = (
+        UniqueConstraint(
+            "original_filename",
+            "file_sha256",
+            name="uq_uploaded_document_name_hash",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     original_filename: Mapped[str] = mapped_column(String(255), nullable=False)

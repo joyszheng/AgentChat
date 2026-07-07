@@ -448,14 +448,6 @@ export default function MCPPage() {
             ))}
           </section>
 
-          <Alert
-            type="info"
-            showIcon
-            title="推荐配置顺序"
-            description="先以停用状态保存服务，点击“测试连接”发现工具，再编辑白名单并启用。高德等第三方 MCP 的密钥可以放在请求 Header 中，密钥不会在页面回显。"
-            className="rounded-xl"
-          />
-
           {loading ? (
             <div className="grid gap-4 lg:grid-cols-2">
               {[0, 1].map((item) => (

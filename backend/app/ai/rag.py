@@ -240,6 +240,9 @@ def add_documents_to_index(
         CHUNK_OVERLAP,
     )
     chunks = splitter.split_documents(documents)
+    if document_id is not None:
+        for chunk in chunks:
+            chunk.metadata = {**chunk.metadata, "document_id": document_id}
     chunk_lengths = [len(chunk.page_content) for chunk in chunks]
     logger.info(
         "[%s] Chunking completed documents=%s chunks=%s min_chars=%s max_chars=%s "
@@ -270,9 +273,9 @@ def add_documents_to_index(
 
 def delete_document_from_index(
     *,
+    document_id: int | None = None,
     file_sha256: str | None,
     source: str,
-    document_id: int | None = None,
 ) -> int:
     """按文件哈希（旧记录回退到源路径）删除文档的全部向量分片。"""
 
@@ -286,21 +289,37 @@ def delete_document_from_index(
         )
         return 0
 
+    selectors: list[tuple[str, str]] = []
+    if document_id is not None:
+        selectors.append((
+            f'metadata["document_id"] == {json.dumps(document_id)}',
+            f"document_id:{document_id}",
+        ))
     if file_sha256:
-        expression = f'metadata["file_sha256"] == {json.dumps(file_sha256)}'
-        selector = f"sha256:{file_sha256[:12]}"
-    else:
-        expression = f'metadata["source"] == {json.dumps(source)}'
-        selector = "source_path"
+        selectors.append((
+            f'metadata["file_sha256"] == {json.dumps(file_sha256)}',
+            f"sha256:{file_sha256[:12]}",
+        ))
+    selectors.append((
+        f'metadata["source"] == {json.dumps(source)}',
+        "source_path",
+    ))
 
     started_at = time.perf_counter()
-    logger.info(
-        "[%s] Vector cleanup started collection=%s selector=%s",
-        scope,
-        AGENTCHAT_MILVUS_COLLECTION,
-        selector,
-    )
-    ids = store.get_pks(expression, timeout=VECTOR_OPERATION_TIMEOUT) or []
+    ids = []
+    matched_selector = selectors[-1][1]
+    for expression, selector in selectors:
+        logger.info(
+            "[%s] Vector cleanup lookup collection=%s selector=%s",
+            scope,
+            AGENTCHAT_MILVUS_COLLECTION,
+            selector,
+        )
+        ids = store.get_pks(expression, timeout=VECTOR_OPERATION_TIMEOUT) or []
+        if ids:
+            matched_selector = selector
+            break
+
     if not ids:
         logger.info(
             "[%s] Vector cleanup completed deleted_chunks=0 elapsed=%.2fs",
@@ -313,8 +332,9 @@ def delete_document_from_index(
         raise RuntimeError("Milvus 向量分片删除失败")
 
     logger.info(
-        "[%s] Vector cleanup completed deleted_chunks=%s elapsed=%.2fs",
+        "[%s] Vector cleanup completed selector=%s deleted_chunks=%s elapsed=%.2fs",
         scope,
+        matched_selector,
         len(ids),
         time.perf_counter() - started_at,
     )

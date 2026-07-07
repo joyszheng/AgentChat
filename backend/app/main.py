@@ -19,6 +19,7 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import DateTime, inspect, text
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 from starlette.responses import FileResponse, StreamingResponse
 
@@ -35,6 +36,9 @@ from .mcp import mcp_registry
 from .services.email import send_email, format_document_notification_email
 from .services.dependencies import require_auth
 from .services.config import migrate_legacy_ai_settings
+
+
+logger = logging.getLogger("uvicorn.error")
 
 
 def _ensure_chat_session_soft_delete_schema() -> bool:
@@ -76,14 +80,75 @@ def _ensure_chat_session_soft_delete_schema() -> bool:
     return schema_changed
 
 
+def _ensure_uploaded_document_unique_schema() -> bool:
+    """为旧安装补齐上传文档的重复保护索引。"""
+
+    inspector = inspect(engine)
+    if not inspector.has_table("uploaded_documents"):
+        return False
+
+    index_names = {
+        index["name"]
+        for index in inspector.get_indexes("uploaded_documents")
+    }
+    unique_constraints = {
+        constraint["name"]
+        for constraint in inspector.get_unique_constraints("uploaded_documents")
+    }
+    if (
+        "uq_uploaded_document_name_hash" in index_names
+        or "uq_uploaded_document_name_hash" in unique_constraints
+    ):
+        return False
+
+    with engine.begin() as connection:
+        duplicate = connection.execute(
+            text(
+                "SELECT original_filename, file_sha256, COUNT(*) AS duplicate_count "
+                "FROM uploaded_documents "
+                "WHERE file_sha256 IS NOT NULL "
+                "GROUP BY original_filename, file_sha256 "
+                "HAVING COUNT(*) > 1 "
+                "LIMIT 1"
+            )
+        ).mappings().first()
+    if duplicate is not None:
+        logger.warning(
+            "[database] Uploaded document duplicate guard not created; "
+            "duplicate rows exist filename=%r sha256=%s count=%s",
+            duplicate["original_filename"],
+            str(duplicate["file_sha256"])[:12],
+            duplicate["duplicate_count"],
+        )
+        return False
+
+    try:
+        with engine.begin() as connection:
+            connection.execute(
+                text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_uploaded_document_name_hash "
+                    "ON uploaded_documents (original_filename, file_sha256)"
+                )
+            )
+    except SQLAlchemyError:
+        logger.warning(
+            "[database] Could not add uploaded_documents duplicate guard; "
+            "existing duplicate rows may need manual cleanup"
+        )
+        return False
+
+    return True
+
+
 # 开发阶段启动时自动建表；生产环境建议改用数据库迁移工具。
 models.Base.metadata.create_all(bind=engine)
 soft_delete_schema_added = _ensure_chat_session_soft_delete_schema()
+upload_unique_schema_added = _ensure_uploaded_document_unique_schema()
 
-# Reuse Uvicorn's configured logger so INFO progress is visible in the server terminal.
-logger = logging.getLogger("uvicorn.error")
 if soft_delete_schema_added:
     logger.info("[database] Ensured chat_sessions soft-delete schema")
+if upload_unique_schema_added:
+    logger.info("[database] Ensured uploaded_documents duplicate guard schema")
 
 
 @asynccontextmanager
@@ -460,21 +525,51 @@ async def upload_file(
     )
 
     file_sha256 = hashlib.sha256(content).hexdigest()
+    duplicate_document = crud.get_uploaded_document_by_name_hash(
+        db,
+        original_filename=original_filename,
+        file_sha256=file_sha256,
+    )
+    if duplicate_document is not None:
+        logger.info(
+            "[upload] Duplicate rejected file=%r sha256=%s existing_document_id=%s",
+            original_filename,
+            file_sha256[:12],
+            duplicate_document.id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="同名且内容相同的文档已存在，请勿重复上传",
+        )
+
     new_filename = f"{uuid4().hex}{suffix}"
     file_path = UPLOAD_DIR / new_filename
 
     file_path.write_bytes(content)
 
-    upload_record = crud.create_uploaded_document(
-        db,
-        original_filename=original_filename,
-        stored_filename=new_filename,
-        content_type=file.content_type,
-        file_ext=suffix,
-        size_bytes=len(content),
-        saved_to=str(file_path),
-        file_sha256=file_sha256,
-    )
+    try:
+        upload_record = crud.create_uploaded_document(
+            db,
+            original_filename=original_filename,
+            stored_filename=new_filename,
+            content_type=file.content_type,
+            file_ext=suffix,
+            size_bytes=len(content),
+            saved_to=str(file_path),
+            file_sha256=file_sha256,
+        )
+    except IntegrityError as exc:
+        db.rollback()
+        file_path.unlink(missing_ok=True)
+        logger.info(
+            "[upload] Duplicate rejected by database file=%r sha256=%s",
+            original_filename,
+            file_sha256[:12],
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="同名且内容相同的文档已存在，请勿重复上传",
+        ) from exc
     upload_record = crud.mark_uploaded_document_processing(db, upload_record.id)
 
     logger.info(
@@ -584,9 +679,9 @@ def delete_document(
     if document.status == "indexed" or document.chunk_count > 0:
         try:
             vector_chunks_deleted = delete_document_from_index(
+                document_id=document_id,
                 file_sha256=document.file_sha256,
                 source=document.saved_to,
-                document_id=document_id,
             )
         except Exception as exc:
             logger.exception(
