@@ -112,3 +112,43 @@ def test_rag_returns_500_when_service_fails(monkeypatch):
     assert response.json() == {
         "detail": "文档问答服务暂时不可用"
     }
+
+
+def test_unified_assistant_persists_route_sources_and_tools(monkeypatch):
+    async def fake_run_unified_assistant(**kwargs):
+        assert kwargs["model_input"]
+        assert kwargs["mcp_tools"] == []
+        return SimpleNamespace(
+            answer="统一助手回答",
+            route="rag+mcp",
+            sources=["guide.md"],
+            tools_used=["search_knowledge_base", "demo__echo"],
+        )
+
+    monkeypatch.setattr(ai_router, "run_unified_assistant", fake_run_unified_assistant)
+    monkeypatch.setattr(ai_router, "get_llm_from_config", lambda _db: object())
+    monkeypatch.setattr(ai_router, "get_embeddings_from_config", lambda _db: object())
+    monkeypatch.setattr(ai_router.mcp_registry, "get_tools", lambda **_kwargs: [])
+
+    response = client.post(
+        "/ai/assistant",
+        json={"message": "[TEST] 需要自动选择工具"},
+    )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["answer"] == "统一助手回答"
+    assert data["route"] == "rag+mcp"
+    assert data["sources"] == ["guide.md"]
+    assert data["tools_used"] == ["search_knowledge_base", "demo__echo"]
+
+    messages_response = client.get(f"/ai/sessions/{data['session_id']}/messages")
+    assert messages_response.status_code == 200
+    messages = messages_response.json()
+    assert messages[-1]["content"] == "统一助手回答"
+    assert messages[-1]["message_metadata"] == {
+        "model": "assistant",
+        "route": "rag+mcp",
+        "sources": ["guide.md"],
+        "tools_used": ["search_knowledge_base", "demo__echo"],
+    }

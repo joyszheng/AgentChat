@@ -126,6 +126,14 @@ class MCPAssistantResponse(ChatResponse):
     tools_used: list[str] = Field(default_factory=list)
 
 
+class AssistantResponse(ChatResponse):
+    """Response from the unified assistant across chat, RAG, tasks, and MCP."""
+
+    route: str = Field(description="Selected execution route")
+    sources: list[str] = Field(default_factory=list)
+    tools_used: list[str] = Field(default_factory=list)
+
+
 class SystemSettingBase(BaseModel):
     """系统配置基础模型。"""
 

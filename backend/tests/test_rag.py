@@ -43,7 +43,93 @@ def test_add_documents_to_index_tags_chunks_with_document_id(monkeypatch):
 
     assert chunk_count == 1
     assert captured["documents"][0].metadata["document_id"] == 7
+    assert captured["documents"][0].metadata["chunk_index"] == 0
+    assert captured["documents"][0].metadata["chunk_total"] == 1
     assert captured["kwargs"]["document_id"] == 7
+
+
+def test_chunk_ids_use_file_hash_for_stable_duplicate_upserts():
+    first = Document(
+        page_content="same content",
+        metadata={
+            "source": "uploads/first.txt",
+            "file_sha256": "abc123",
+            "element_index": 0,
+            "chunk_index": 0,
+        },
+    )
+    duplicate_upload = Document(
+        page_content="same content",
+        metadata={
+            "source": "uploads/second.txt",
+            "file_sha256": "abc123",
+            "element_index": 0,
+            "chunk_index": 0,
+        },
+    )
+
+    assert rag._chunk_ids([first]) == rag._chunk_ids([duplicate_upload])
+
+
+def test_retrieve_documents_fetches_then_dedupes(monkeypatch):
+    first = Document(
+        page_content="alpha",
+        metadata={"file_sha256": "file-a", "chunk_index": 0},
+    )
+    duplicate = Document(
+        page_content="alpha",
+        metadata={"file_sha256": "file-a", "chunk_index": 0},
+    )
+    second = Document(
+        page_content="beta",
+        metadata={"file_sha256": "file-a", "chunk_index": 1},
+    )
+    third = Document(
+        page_content="gamma",
+        metadata={"file_sha256": "file-a", "chunk_index": 2},
+    )
+    calls = {}
+
+    class FakeRetriever:
+        def invoke(self, question):
+            calls["question"] = question
+            return [first, duplicate, second, third]
+
+    class FakeStore:
+        def as_retriever(self, **kwargs):
+            calls["kwargs"] = kwargs
+            return FakeRetriever()
+
+    monkeypatch.setattr(rag, "ensure_default_documents_indexed", lambda *_args: None)
+    monkeypatch.setattr(rag, "get_vector_store", lambda _embedding: FakeStore())
+    monkeypatch.setattr(rag, "RAG_SEARCH_TYPE", "similarity")
+    monkeypatch.setattr(rag, "RAG_FETCH_K", 4)
+    monkeypatch.setattr(rag, "RAG_TOP_K", 2)
+
+    documents = rag.retrieve_documents("question", embedding_function=object())
+
+    assert documents == [first, second]
+    assert calls["question"] == "question"
+    assert calls["kwargs"] == {"search_kwargs": {"k": 4}}
+
+
+def test_documents_to_context_includes_source_metadata(monkeypatch):
+    monkeypatch.setattr(rag, "RAG_CONTEXT_MAX_CHARS", 1000)
+
+    context = rag.documents_to_context([
+        Document(
+            page_content="answer evidence",
+            metadata={
+                "original_filename": "guide.pdf",
+                "page_number": 3,
+                "element_index": 5,
+                "chunk_index": 2,
+            },
+        )
+    ])
+
+    assert "[1] 来源: guide.pdf | page=3 | element=5 | chunk=2" in context
+    assert "answer evidence" in context
 
 
 def test_delete_document_from_index_prefers_document_id(monkeypatch):

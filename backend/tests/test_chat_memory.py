@@ -129,6 +129,55 @@ def test_chat_stream_emits_sse_and_persists_complete_answer(monkeypatch, tmp_pat
     assert messages[-1]["message_metadata"] == {"model": "chat", "streamed": True}
 
 
+def test_rag_stream_emits_sources_and_persists_complete_answer(monkeypatch, tmp_path):
+    main_module = _load_main_with_fake_rag(monkeypatch, tmp_path)
+    ai_router = importlib.import_module("app.routers.ai")
+    payloads = []
+
+    async def fake_astream(input_data):
+        payloads.append(input_data)
+        yield SimpleNamespace(content="知识库")
+        yield SimpleNamespace(content="答案")
+
+    fake_chain = SimpleNamespace(astream=fake_astream)
+    monkeypatch.setattr(ai_router, "create_rag_chain", lambda _llm: fake_chain)
+    monkeypatch.setattr(main_module.ai, "create_rag_chain", lambda _llm: fake_chain)
+
+    client = TestClient(main_module.app)
+    response = client.post("/ai/rag/stream", json={"message": "[TEST] 查询知识库"})
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+
+    events = _parse_sse_events(response.text)
+    assert [event["event"] for event in events] == [
+        "start",
+        "sources",
+        "token",
+        "token",
+        "done",
+    ]
+    assert events[1]["data"] == {"sources": ["guide.md"]}
+    assert events[2]["data"] == {"delta": "知识库"}
+    assert events[3]["data"] == {"delta": "答案"}
+    assert payloads[0] == {
+        "context": "RAG 测试上下文",
+        "question": "[TEST] 查询知识库",
+    }
+
+    session_id = events[0]["data"]["session_id"]
+    messages_response = client.get(f"/ai/sessions/{session_id}/messages")
+    messages = messages_response.json()
+    assert [message["role"] for message in messages] == ["user", "assistant"]
+    assert messages[0]["content"] == "[TEST] 查询知识库"
+    assert messages[-1]["content"] == "知识库答案"
+    assert messages[-1]["message_metadata"] == {
+        "model": "rag",
+        "streamed": True,
+        "sources": ["guide.md"],
+    }
+
+
 def test_chat_stream_emits_error_without_persisting_partial_answer(monkeypatch, tmp_path):
     main_module = _load_main_with_fake_rag(monkeypatch, tmp_path)
     ai_router = importlib.import_module("app.routers.ai")
@@ -221,6 +270,16 @@ def _parse_sse_events(body: str) -> list[dict]:
 def _load_main_with_fake_rag(monkeypatch, tmp_path):
     fake_rag = ModuleType("app.ai.rag")
     fake_rag.ask_document = lambda _question, **_kwargs: ("", [])
+    fake_rag.retrieve_documents = lambda _question, **_kwargs: [
+        SimpleNamespace(
+            page_content="RAG 测试上下文",
+            metadata={"original_filename": "guide.md"},
+        )
+    ]
+    fake_rag.documents_to_context = lambda documents: "\n\n".join(
+        document.page_content for document in documents
+    )
+    fake_rag.document_sources = lambda _documents: ["guide.md"]
     fake_rag.ingest_upload = lambda *_args, **_kwargs: (None, 0)
     fake_rag.delete_document_from_index = lambda **_kwargs: 0
 

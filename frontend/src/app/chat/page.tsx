@@ -6,8 +6,9 @@ import { message, Collapse, Tooltip, Popconfirm, Drawer, Select, Tag } from 'ant
 import { PlusIcon, PanelLeftOpenIcon, PanelLeftCloseIcon, DeleteIcon } from 'lucide-animated';
 import http from '@/lib/http/axios';
 import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 
-type ChatMode = 'chat' | 'rag' | 'mcp';
+type ChatMode = 'auto' | 'chat' | 'rag' | 'mcp';
 
 interface ChatMessageItem {
   id: string;
@@ -16,6 +17,7 @@ interface ChatMessageItem {
   sources?: string[];
   toolsUsed?: string[];
   mode?: ChatMode;
+  route?: string;
   loading?: boolean;
 }
 
@@ -31,13 +33,18 @@ interface ApiChatMessage {
   content: string;
   message_metadata?: {
     model?: string;
+    route?: string;
+    sources?: string[];
     tools_used?: string[];
   };
 }
 
-interface RagResponse {
+interface AssistantResponse {
   answer: string;
-  sources: string[];
+  session_id: number;
+  route?: string;
+  sources?: string[];
+  tools_used?: string[];
 }
 
 interface MCPAssistantResponse {
@@ -47,12 +54,14 @@ interface MCPAssistantResponse {
 }
 
 const CHAT_MODE_OPTIONS: { label: string; value: ChatMode }[] = [
+  { label: '智能助手', value: 'auto' },
   { label: '大模型问答', value: 'chat' },
   { label: '知识库', value: 'rag' },
   { label: 'MCP 工具', value: 'mcp' },
 ];
 
 const MODE_PLACEHOLDER: Record<ChatMode, string> = {
+  auto: '直接提问，智能选择知识库或工具...',
   chat: '请输入问题...',
   rag: '向知识库提问...',
   mcp: '问我需要调用 MCP 工具的问题...',
@@ -96,10 +105,10 @@ export default function ChatPage() {
   const sessionIdRef = useRef<number | null>(null);
 
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
-  const [chatMode, setChatMode] = useState<ChatMode>('chat');
+  const [chatMode, setChatMode] = useState<ChatMode>('auto');
   const [isMobile, setIsMobile] = useState(false);
 
-  const chatModeSelect = (width = 128) => (
+  const chatModeSelect = (width = 144) => (
     <Select<ChatMode>
       aria-label="选择聊天模式"
       size="middle"
@@ -171,7 +180,9 @@ export default function ChatPage() {
         id: m.id.toString(),
         role: m.role,
         content: m.content,
-        mode: m.message_metadata?.model === 'mcp-assistant' ? 'mcp' : 'chat',
+        mode: m.message_metadata?.model === 'assistant' ? 'auto' : m.message_metadata?.model === 'mcp-assistant' ? 'mcp' : m.message_metadata?.model === 'rag' ? 'rag' : 'chat',
+        route: m.message_metadata?.route,
+        sources: m.message_metadata?.sources || [],
         toolsUsed: m.message_metadata?.tools_used || [],
       }));
       setMessages(formatted.length ? formatted : [{ id: 'welcome', role: 'assistant', content: '你好，我是 AgentChat，请问有什么可以帮你？' }]);
@@ -222,23 +233,125 @@ export default function ChatPage() {
     setInputValue('');
     setLoading(true);
 
-    if (chatMode === 'rag') {
+    if (chatMode === 'auto') {
+      let createdNewSession = false;
       try {
-        const res = await http.post<RagResponse, RagResponse>('/ai/rag', { question: text });
-        setMessages((prev) => prev.map((msg) => 
-          msg.id === assistantMsgId 
-            ? { ...msg, content: res.answer, sources: res.sources, loading: false }
+        const res = await http.post<AssistantResponse, AssistantResponse>('/ai/assistant', {
+          message: text,
+          session_id: sessionIdRef.current,
+        });
+
+        if (sessionIdRef.current !== res.session_id) {
+          setSessionId(res.session_id);
+          sessionIdRef.current = res.session_id;
+          createdNewSession = true;
+        }
+
+        setMessages((prev) => prev.map((msg) =>
+          msg.id === assistantMsgId
+            ? {
+                ...msg,
+                content: res.answer,
+                route: res.route,
+                sources: res.sources || [],
+                toolsUsed: res.tools_used || [],
+                loading: false,
+              }
             : msg
         ));
-      } catch {
-        message.error('请求知识库失败');
-        setMessages((prev) => prev.map((msg) => 
-          msg.id === assistantMsgId 
-            ? { ...msg, loading: false }
+      } catch (e) {
+        message.error(getErrorDetail(e, '智能助手请求失败'));
+        setMessages((prev) => prev.map((msg) =>
+          msg.id === assistantMsgId
+            ? {
+                ...msg,
+                content: '智能助手暂时不可用，请稍后重试。',
+                loading: false,
+              }
             : msg
         ));
       } finally {
         setLoading(false);
+        if (createdNewSession) {
+          fetchSessions(true);
+        }
+      }
+      return;
+    }
+
+    if (chatMode === 'rag') {
+      let createdNewSession = false;
+      try {
+        const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/ai/rag/stream`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message: text, session_id: sessionIdRef.current })
+        });
+
+        if (!res.body) throw new Error('No stream body');
+
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let currentEvent = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            if (line.startsWith('event: ')) {
+              currentEvent = line.slice(7).trim();
+            } else if (line.startsWith('data: ')) {
+              const dataStr = line.slice(6).trim();
+              if (dataStr) {
+                try {
+                  const data = JSON.parse(dataStr);
+                  if (currentEvent === 'token' && data.delta) {
+                    setMessages((prev) => prev.map((msg) =>
+                      msg.id === assistantMsgId
+                        ? { ...msg, content: msg.content + data.delta, loading: false }
+                        : msg
+                    ));
+                  } else if (currentEvent === 'sources' && Array.isArray(data.sources)) {
+                    setMessages((prev) => prev.map((msg) =>
+                      msg.id === assistantMsgId
+                        ? { ...msg, sources: data.sources }
+                        : msg
+                    ));
+                  } else if (currentEvent === 'start' && data.session_id) {
+                    if (sessionIdRef.current !== data.session_id) {
+                      setSessionId(data.session_id);
+                      sessionIdRef.current = data.session_id;
+                      createdNewSession = true;
+                    }
+                  } else if (currentEvent === 'error') {
+                    message.error(data.message || '知识库请求出错');
+                  }
+                } catch (e) {
+                  console.error('Failed to parse SSE data', e);
+                }
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.error(e);
+        message.error('请求知识库失败');
+      } finally {
+        setLoading(false);
+        setMessages((prev) => prev.map((msg) =>
+          msg.id === assistantMsgId
+            ? { ...msg, loading: false }
+            : msg
+        ));
+        if (createdNewSession) {
+          fetchSessions(true);
+        }
       }
       return;
     }
@@ -452,7 +565,7 @@ export default function ChatPage() {
           </div>
           <div>
             {isMobile && (
-              chatModeSelect(124)
+              chatModeSelect(144)
             )}
           </div>
         </div>
@@ -463,7 +576,7 @@ export default function ChatPage() {
               loading={msg.loading}
               loadingRender={() => (
                 <div className="text-gray-400 text-sm animate-pulse flex items-center gap-2">
-                  {msg.mode === 'mcp' ? 'MCP 工具助手处理中...' : 'AI 思考中...'}
+                  {msg.mode === 'auto' ? '智能助手处理中...' : msg.mode === 'mcp' ? 'MCP 工具助手处理中...' : 'AI 思考中...'}
                 </div>
               )}
               placement={msg.role === 'user' ? 'end' : 'start'}
@@ -488,7 +601,7 @@ export default function ChatPage() {
                 ) : (
                   <>
                     <div className="prose prose-sm max-w-none text-gray-800 break-words [&>p]:mb-0 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
-                      <ReactMarkdown>{msg.content}</ReactMarkdown>
+                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
                     </div>
                     {msg.sources && msg.sources.length > 0 && (
                       <Collapse
@@ -509,10 +622,17 @@ export default function ChatPage() {
                         ]}
                       />
                     )}
-                    {msg.toolsUsed && msg.toolsUsed.length > 0 && (
+                    {(msg.route || (msg.toolsUsed && msg.toolsUsed.length > 0)) && (
                       <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-gray-100 pt-2">
-                        <span className="text-xs font-medium text-gray-500">调用工具</span>
-                        {msg.toolsUsed.map((toolName: string) => (
+                        {msg.route && (
+                          <Tag color="geekblue" className="m-0 max-w-full truncate font-mono text-xs">
+                            {msg.route}
+                          </Tag>
+                        )}
+                        {msg.toolsUsed && msg.toolsUsed.length > 0 && (
+                          <span className="text-xs font-medium text-gray-500">调用工具</span>
+                        )}
+                        {msg.toolsUsed?.map((toolName: string) => (
                           <Tag key={toolName} color="blue" className="m-0 max-w-full truncate font-mono text-xs">
                             {toolName}
                           </Tag>

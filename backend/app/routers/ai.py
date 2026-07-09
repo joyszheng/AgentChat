@@ -11,12 +11,13 @@ from starlette.responses import StreamingResponse
 
 from .. import crud, schemas
 from ..ai.agents import create_mcp_agent, create_task_agent
-from ..ai.chains import create_chat_chain
+from ..ai.chains import create_chat_chain, create_rag_chain
 from ..ai.config import get_embeddings_from_config, get_llm_from_config
-from ..ai.rag import ask_document
+from ..ai.orchestrator import run_unified_assistant
+from ..ai.rag import ask_document, document_sources, documents_to_context, retrieve_documents
 from ..database import SessionLocal, get_db
 from ..mcp import mcp_registry
-from ..services.dependencies import require_auth
+from ..services.dependencies import get_current_user, require_auth
 
 router = APIRouter(prefix="/ai", tags=["AI"])
 logger = logging.getLogger(__name__)
@@ -164,12 +165,17 @@ async def chat_stream(
     )
 
 
-def _prepare_chat_request(request: schemas.ChatRequest, db: Session):
+def _prepare_chat_request(
+    request: schemas.ChatRequest,
+    db: Session,
+    *,
+    mode: str = "chat",
+):
     session = crud.get_or_create_chat_session(
         db,
         session_id=request.session_id,
         title=_default_session_title(request.message),
-        mode="chat",
+        mode=mode,
     )
     if session is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="会话不存在")
@@ -213,6 +219,55 @@ def tasks_assistant(
             status_code=500,
             detail="任务助手暂时不可用，请稍后再试"
         )
+
+
+@router.post("/assistant", response_model=schemas.AssistantResponse)
+async def assistant(
+    request: schemas.ChatRequest,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+) -> schemas.AssistantResponse:
+    """Unified assistant that can answer directly, search RAG, and call tools."""
+
+    session, user_message, model_input = _prepare_chat_request(request, db, mode="assistant")
+    is_admin = bool(user and user.role == "admin")
+    mcp_tools = mcp_registry.get_tools(is_admin=is_admin)
+
+    try:
+        result = await run_unified_assistant(
+            llm=get_llm_from_config(db),
+            model_input=model_input,
+            embedding_function=get_embeddings_from_config(db),
+            mcp_tools=mcp_tools,
+        )
+    except Exception:
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail="智能助手暂时不可用，请稍后重试",
+        )
+
+    assistant_message = crud.create_chat_message(
+        db,
+        session_id=session.id,
+        role="assistant",
+        content=result.answer,
+        message_metadata={
+            "model": "assistant",
+            "route": result.route,
+            "sources": result.sources,
+            "tools_used": result.tools_used,
+        },
+    )
+    return schemas.AssistantResponse(
+        answer=result.answer,
+        session_id=session.id,
+        user_message_id=user_message.id,
+        assistant_message_id=assistant_message.id,
+        route=result.route,
+        sources=result.sources,
+        tools_used=result.tools_used,
+    )
 
 
 @router.post("/mcp-assistant", response_model=schemas.MCPAssistantResponse)
@@ -276,6 +331,7 @@ class RagResponse(BaseModel):
     answer: str
     sources: list[str]
 
+
 @router.post("/rag", response_model=RagResponse)
 def rag(request: RagRequest, db: Session = Depends(get_db)) -> RagResponse:
     try:
@@ -295,6 +351,86 @@ def rag(request: RagRequest, db: Session = Depends(get_db)) -> RagResponse:
             status_code=500,
             detail="文档问答服务暂时不可用",
         )
+
+
+@router.post("/rag/stream")
+async def rag_stream(
+    request: schemas.ChatRequest,
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    """以 SSE 逐段返回 RAG 答案，并保存用户问题、助手答案和引用来源。"""
+
+    session, user_message, _model_input = _prepare_chat_request(request, db, mode="rag")
+    rag_chain = create_rag_chain(get_llm_from_config(db))
+    embedding_function = get_embeddings_from_config(db)
+    session_id = session.id
+    user_message_id = user_message.id
+    question = request.message
+
+    async def event_stream() -> AsyncIterator[str]:
+        yield _sse_event(
+            "start",
+            {
+                "session_id": session_id,
+                "user_message_id": user_message_id,
+            },
+        )
+
+        answer_parts: list[str] = []
+
+        try:
+            documents = retrieve_documents(question, embedding_function=embedding_function)
+            context = documents_to_context(documents)
+            sources = document_sources(documents)
+            yield _sse_event("sources", {"sources": sources})
+
+            async for text in _stream_rag_text(context, question, rag_chain):
+                answer_parts.append(text)
+                yield _sse_event("token", {"delta": text})
+
+            answer = "".join(answer_parts)
+            with SessionLocal() as stream_db:
+                assistant_message = crud.create_chat_message(
+                    stream_db,
+                    session_id=session_id,
+                    role="assistant",
+                    content=answer,
+                    message_metadata={
+                        "model": "rag",
+                        "streamed": True,
+                        "sources": sources,
+                    },
+                )
+                assistant_message_id = assistant_message.id
+        except Exception:
+            traceback.print_exc()
+            yield _sse_event(
+                "error",
+                {
+                    "code": "rag_service_unavailable",
+                    "message": "文档问答服务暂时不可用",
+                },
+            )
+            return
+
+        yield _sse_event(
+            "done",
+            {
+                "session_id": session_id,
+                "user_message_id": user_message_id,
+                "assistant_message_id": assistant_message_id,
+            },
+        )
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 def _default_session_title(message: str) -> str:
@@ -393,6 +529,41 @@ async def _stream_chat_text(model_input: str, chat_chain) -> AsyncIterator[str]:
     text = _chunk_text(response)
     if not text:
         raise ValueError("AI model returned an empty response")
+
+    yield text
+
+
+async def _stream_rag_text(context: str, question: str, rag_chain) -> AsyncIterator[str]:
+    """流式读取 RAG 模型文本；上游未返回分片时降级为一次性异步调用。"""
+
+    payload = {
+        "context": context,
+        "question": question,
+    }
+    received_text = False
+    try:
+        async for chunk in rag_chain.astream(payload):
+            text = _chunk_text(chunk)
+            if not text:
+                continue
+
+            received_text = True
+            yield text
+    except ValueError as exc:
+        if received_text or str(exc) != NO_GENERATION_CHUNKS_ERROR:
+            raise
+
+        logger.warning("RAG 模型流式响应未返回内容分片，降级为非流式异步调用")
+    else:
+        if received_text:
+            return
+
+        logger.warning("RAG 模型流式响应内容为空，降级为非流式异步调用")
+
+    response = await rag_chain.ainvoke(payload)
+    text = _chunk_text(response)
+    if not text:
+        raise ValueError("RAG model returned an empty response")
 
     yield text
 
