@@ -4,13 +4,20 @@ import React, { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { LockKeyholeIcon, UserIcon } from 'lucide-animated';
 import axios from 'axios';
+import http from '@/lib/http/axios';
 
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8000';
+const DEFAULT_LOGIN_USERNAME = process.env.NEXT_PUBLIC_DEFAULT_LOGIN_USERNAME || 'admin';
+const DEFAULT_LOGIN_PASSWORD = process.env.NEXT_PUBLIC_DEFAULT_LOGIN_PASSWORD || 'admin123';
+
+interface LoginResponse {
+  access_token: string;
+  user: unknown;
+}
 
 export default function LoginPage() {
   const router = useRouter();
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
+  const [username, setUsername] = useState(DEFAULT_LOGIN_USERNAME);
+  const [password, setPassword] = useState(DEFAULT_LOGIN_PASSWORD);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
 
@@ -20,12 +27,12 @@ export default function LoginPage() {
     setLoading(true);
 
     try {
-      const response = await axios.post(`${API_BASE_URL}/auth/login`, {
+      const response = await http.post<LoginResponse, LoginResponse>('/auth/login', {
         username,
         password,
       });
 
-      const { access_token, user } = response.data;
+      const { access_token, user } = response;
 
       // 保存 token 和用户信息到 localStorage
       localStorage.setItem('access_token', access_token);
@@ -33,9 +40,10 @@ export default function LoginPage() {
 
       // 跳转到首页
       router.push('/chat');
-    } catch (err: any) {
+    } catch (err: unknown) {
       console.error('Login failed:', err);
-      setError(err.response?.data?.detail || '登录失败，请检查用户名和密码');
+      const detail = axios.isAxiosError(err) ? err.response?.data?.detail : undefined;
+      setError(typeof detail === 'string' ? detail : '登录失败，请检查用户名和密码');
     } finally {
       setLoading(false);
     }
