@@ -2,7 +2,15 @@ from datetime import datetime
 
 from typing import Any, Literal
 
-from pydantic import AnyHttpUrl, BaseModel, Field, field_validator
+from pydantic import AnyHttpUrl, BaseModel, Field, field_validator, model_validator
+
+
+TaskStatus = Literal["todo", "in_progress", "blocked", "done", "canceled"]
+TaskPriority = Literal["low", "normal", "high", "urgent"]
+TaskSource = Literal["manual", "ai"]
+TaskExecutionMode = Literal["manual", "ai_auto"]
+TaskRecurrenceRule = Literal["none", "daily"]
+TaskRunStatus = Literal["idle", "pending", "queued", "running", "success", "failed"]
 
 
 class TaskCreate(BaseModel):
@@ -11,6 +19,28 @@ class TaskCreate(BaseModel):
     title: str = Field(min_length=1, max_length=100)
     description: str | None = Field(default=None, max_length=500)
     completed: bool = False
+    status: TaskStatus | None = None
+    priority: TaskPriority = "normal"
+    due_at: datetime | None = None
+    source: TaskSource = "manual"
+    execution_mode: TaskExecutionMode = "manual"
+    schedule_at: datetime | None = None
+    recurrence_rule: TaskRecurrenceRule = "none"
+    ai_prompt: str | None = Field(default=None, max_length=4000)
+    notify_email: str | None = Field(default=None, max_length=255)
+
+    @model_validator(mode="after")
+    def normalize_status(self):
+        if self.status is None:
+            self.status = "done" if self.completed else "todo"
+        else:
+            self.completed = self.status == "done"
+        if self.execution_mode == "ai_auto":
+            if self.schedule_at is None:
+                raise ValueError("AI 自动任务需要设置执行时间")
+            if not self.ai_prompt or not self.ai_prompt.strip():
+                raise ValueError("AI 自动任务需要填写执行说明")
+        return self
 
 
 class TaskUpdate(BaseModel):
@@ -19,15 +49,59 @@ class TaskUpdate(BaseModel):
     title: str | None = Field(default=None, min_length=1, max_length=100)
     description: str | None = Field(default=None, max_length=500)
     completed: bool | None = None
+    status: TaskStatus | None = None
+    priority: TaskPriority | None = None
+    due_at: datetime | None = None
+    execution_mode: TaskExecutionMode | None = None
+    schedule_at: datetime | None = None
+    recurrence_rule: TaskRecurrenceRule | None = None
+    ai_prompt: str | None = Field(default=None, max_length=4000)
+    notify_email: str | None = Field(default=None, max_length=255)
+
+    @model_validator(mode="after")
+    def normalize_status(self):
+        if self.status is not None:
+            self.completed = self.status == "done"
+        elif self.completed is not None:
+            self.status = "done" if self.completed else "todo"
+        return self
 
 
 class TaskResponse(TaskCreate):
     """任务接口返回的数据结构。"""
 
     id: int
+    user_id: int | None
+    last_run_at: datetime | None
+    next_run_at: datetime | None
+    run_status: str
+    run_error: str | None
+    run_count: int
+    created_at: datetime
+    updated_at: datetime
 
     model_config = {
         # 允许直接从 SQLAlchemy ORM 对象生成响应模型。
+        "from_attributes": True
+    }
+
+
+class TaskRunResponse(BaseModel):
+    """AI 自动任务单次执行记录。"""
+
+    id: int
+    task_id: int
+    user_id: int | None
+    status: str
+    input_snapshot: dict
+    output: str | None
+    error_message: str | None
+    tools_used: list[str]
+    email_sent: bool
+    started_at: datetime
+    finished_at: datetime | None
+
+    model_config = {
         "from_attributes": True
     }
 
@@ -170,6 +244,28 @@ class SystemSettingBatchUpdate(BaseModel):
     """批量更新系统配置。"""
 
     settings: list[SystemSettingCreate]
+
+
+class ModelOptionsRequest(BaseModel):
+    """Request available model IDs from an OpenAI-compatible provider."""
+
+    kind: Literal["llm", "embedding"]
+    base_url: str | None = Field(default=None, max_length=500)
+    api_key: str | None = Field(default=None, max_length=1000)
+
+
+class ModelOption(BaseModel):
+    """One model returned by an OpenAI-compatible /models endpoint."""
+
+    id: str
+    owned_by: str | None = None
+
+
+class ModelOptionsResponse(BaseModel):
+    """Available models for a provider configuration."""
+
+    models: list[ModelOption]
+    count: int
 
 
 class MCPServerBase(BaseModel):

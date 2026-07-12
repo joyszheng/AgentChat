@@ -18,137 +18,31 @@ from fastapi import (
     status,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import DateTime, inspect, text
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from starlette.responses import FileResponse, StreamingResponse
 
 from pathlib import Path
 from uuid import uuid4
 
-from . import crud, models, schemas
+from . import crud, schemas
 from .ai.document_processing import DocumentProcessingError, validate_document_extension
 from .ai.config import get_embeddings_from_config
 from .ai.rag import delete_document_from_index, ingest_upload
-from .database import SessionLocal, engine, get_db
+from .database import SessionLocal, get_db
 from .routers import tasks, ai, settings, auth, mcp as mcp_router
 from .mcp import mcp_registry
 from .services.email import send_email, format_document_notification_email
 from .services.dependencies import require_auth
 from .services.config import migrate_legacy_ai_settings
+from .services.task_executor import (
+    cleanup_stale_ai_task_jobs,
+    reset_stuck_ai_tasks,
+    run_task_scheduler,
+)
 
 
 logger = logging.getLogger("uvicorn.error")
-
-
-def _ensure_chat_session_soft_delete_schema() -> bool:
-    """Add deleted_at and its index for installations created before soft deletion."""
-    inspector = inspect(engine)
-    if not inspector.has_table("chat_sessions"):
-        return False
-
-    schema_changed = False
-    column_names = {
-        column["name"]
-        for column in inspector.get_columns("chat_sessions")
-    }
-    if "deleted_at" not in column_names:
-        column_type = DateTime(timezone=True).compile(dialect=engine.dialect)
-        with engine.begin() as connection:
-            connection.execute(
-                text(
-                    "ALTER TABLE chat_sessions "
-                    f"ADD COLUMN deleted_at {column_type} NULL"
-                )
-            )
-        schema_changed = True
-
-    index_names = {
-        index["name"]
-        for index in inspect(engine).get_indexes("chat_sessions")
-    }
-    if "ix_chat_sessions_deleted_at" not in index_names:
-        with engine.begin() as connection:
-            connection.execute(
-                text(
-                    "CREATE INDEX IF NOT EXISTS ix_chat_sessions_deleted_at "
-                    "ON chat_sessions (deleted_at)"
-                )
-            )
-        schema_changed = True
-
-    return schema_changed
-
-
-def _ensure_uploaded_document_unique_schema() -> bool:
-    """为旧安装补齐上传文档的重复保护索引。"""
-
-    inspector = inspect(engine)
-    if not inspector.has_table("uploaded_documents"):
-        return False
-
-    index_names = {
-        index["name"]
-        for index in inspector.get_indexes("uploaded_documents")
-    }
-    unique_constraints = {
-        constraint["name"]
-        for constraint in inspector.get_unique_constraints("uploaded_documents")
-    }
-    if (
-        "uq_uploaded_document_name_hash" in index_names
-        or "uq_uploaded_document_name_hash" in unique_constraints
-    ):
-        return False
-
-    with engine.begin() as connection:
-        duplicate = connection.execute(
-            text(
-                "SELECT original_filename, file_sha256, COUNT(*) AS duplicate_count "
-                "FROM uploaded_documents "
-                "WHERE file_sha256 IS NOT NULL "
-                "GROUP BY original_filename, file_sha256 "
-                "HAVING COUNT(*) > 1 "
-                "LIMIT 1"
-            )
-        ).mappings().first()
-    if duplicate is not None:
-        logger.warning(
-            "[database] Uploaded document duplicate guard not created; "
-            "duplicate rows exist filename=%r sha256=%s count=%s",
-            duplicate["original_filename"],
-            str(duplicate["file_sha256"])[:12],
-            duplicate["duplicate_count"],
-        )
-        return False
-
-    try:
-        with engine.begin() as connection:
-            connection.execute(
-                text(
-                    "CREATE UNIQUE INDEX IF NOT EXISTS uq_uploaded_document_name_hash "
-                    "ON uploaded_documents (original_filename, file_sha256)"
-                )
-            )
-    except SQLAlchemyError:
-        logger.warning(
-            "[database] Could not add uploaded_documents duplicate guard; "
-            "existing duplicate rows may need manual cleanup"
-        )
-        return False
-
-    return True
-
-
-# 开发阶段启动时自动建表；生产环境建议改用数据库迁移工具。
-models.Base.metadata.create_all(bind=engine)
-soft_delete_schema_added = _ensure_chat_session_soft_delete_schema()
-upload_unique_schema_added = _ensure_uploaded_document_unique_schema()
-
-if soft_delete_schema_added:
-    logger.info("[database] Ensured chat_sessions soft-delete schema")
-if upload_unique_schema_added:
-    logger.info("[database] Ensured uploaded_documents duplicate guard schema")
 
 
 @asynccontextmanager
@@ -205,8 +99,32 @@ async def lifespan(_app: FastAPI):
     _app.state.mcp_registry = mcp_registry
     await mcp_registry.refresh()
     try:
+        recovered_tasks = reset_stuck_ai_tasks()
+        if recovered_tasks:
+            logger.warning(
+                "[task_executor] Recovered stuck AI tasks on startup count=%s",
+                recovered_tasks,
+            )
+    except Exception:
+        logger.exception("[task_executor] Failed to recover stuck AI tasks on startup")
+    try:
+        await cleanup_stale_ai_task_jobs()
+    except Exception:
+        logger.exception("[task_executor] Failed to clean stale AI task jobs on startup")
+
+    task_scheduler_stop = asyncio.Event()
+    task_scheduler_task = asyncio.create_task(
+        run_task_scheduler(stop_event=task_scheduler_stop)
+    )
+    try:
         yield
     finally:
+        task_scheduler_stop.set()
+        task_scheduler_task.cancel()
+        try:
+            await task_scheduler_task
+        except asyncio.CancelledError:
+            pass
         await mcp_registry.close()
 
 

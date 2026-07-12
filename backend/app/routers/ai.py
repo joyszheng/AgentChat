@@ -1,6 +1,5 @@
 import json
 import logging
-import traceback
 from collections.abc import AsyncIterator
 from typing import Annotated
 
@@ -13,7 +12,8 @@ from .. import crud, schemas
 from ..ai.agents import create_mcp_agent, create_task_agent
 from ..ai.chains import create_chat_chain, create_rag_chain
 from ..ai.config import get_embeddings_from_config, get_llm_from_config
-from ..ai.orchestrator import run_unified_assistant
+from ..ai.errors import ai_sse_error_payload, raise_ai_http_exception
+from ..ai.orchestrator import _sanitize_mcp_answer, run_unified_assistant, stream_unified_assistant
 from ..ai.rag import ask_document, document_sources, documents_to_context, retrieve_documents
 from ..database import SessionLocal, get_db
 from ..mcp import mcp_registry
@@ -76,9 +76,13 @@ def chat(request: schemas.ChatRequest, db: Session = Depends(get_db)) -> schemas
 
     try:
         response = chat_chain.invoke({"message": model_input})
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="AI 服务暂时不可用，请稍后重试")
+    except Exception as exc:
+        raise_ai_http_exception(
+            logger=logger,
+            operation="chat",
+            exc=exc,
+            detail="AI 服务暂时不可用，请稍后重试",
+        )
 
     assistant_message = crud.create_chat_message(
         db,
@@ -134,14 +138,16 @@ async def chat_stream(
                     message_metadata={"model": "chat", "streamed": True},
                 )
                 assistant_message_id = assistant_message.id
-        except Exception:
-            traceback.print_exc()
+        except Exception as exc:
             yield _sse_event(
                 "error",
-                {
-                    "code": "ai_service_unavailable",
-                    "message": "AI 服务暂时不可用，请稍后重试",
-                },
+                ai_sse_error_payload(
+                    logger=logger,
+                    operation="chat_stream",
+                    exc=exc,
+                    default_code="ai_service_unavailable",
+                    message="AI 服务暂时不可用，请稍后重试",
+                ),
             )
             return
 
@@ -200,9 +206,10 @@ def _prepare_chat_request(
 def tasks_assistant(
     request: schemas.ChatRequest,
     db: Session = Depends(get_db),
+    user=Depends(require_auth),
 ) -> TextResponse:
     try:
-        task_agent = create_task_agent(get_llm_from_config(db))
+        task_agent = create_task_agent(get_llm_from_config(db), user_id=user.id)
         result = task_agent.invoke({
             "messages": [{
                 "role": "user",
@@ -213,11 +220,12 @@ def tasks_assistant(
         answer = result["messages"][-1].content
         return TextResponse(answer=answer)
     
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
-            detail="任务助手暂时不可用，请稍后再试"
+    except Exception as exc:
+        raise_ai_http_exception(
+            logger=logger,
+            operation="tasks_assistant",
+            exc=exc,
+            detail="任务助手暂时不可用，请稍后再试",
         )
 
 
@@ -239,11 +247,13 @@ async def assistant(
             model_input=model_input,
             embedding_function=get_embeddings_from_config(db),
             mcp_tools=mcp_tools,
+            user_id=user.id if user else None,
         )
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
+    except Exception as exc:
+        raise_ai_http_exception(
+            logger=logger,
+            operation="assistant",
+            exc=exc,
             detail="智能助手暂时不可用，请稍后重试",
         )
 
@@ -267,6 +277,118 @@ async def assistant(
         route=result.route,
         sources=result.sources,
         tools_used=result.tools_used,
+    )
+
+
+@router.post("/assistant/stream")
+async def assistant_stream(
+    request: schemas.ChatRequest,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+) -> StreamingResponse:
+    """以 SSE 返回智能助手结果，并在完整生成后保存助手消息。"""
+
+    session, user_message, model_input = _prepare_chat_request(request, db, mode="assistant")
+    is_admin = bool(user and user.role == "admin")
+    user_id = user.id if user else None
+    mcp_tools = mcp_registry.get_tools(is_admin=is_admin)
+    session_id = session.id
+    user_message_id = user_message.id
+    llm = get_llm_from_config(db)
+    embedding_function = get_embeddings_from_config(db)
+
+    async def event_stream() -> AsyncIterator[str]:
+        yield _sse_event(
+            "start",
+            {
+                "session_id": session_id,
+                "user_message_id": user_message_id,
+            },
+        )
+
+        try:
+            result = None
+            async for stream_event in stream_unified_assistant(
+                llm=llm,
+                model_input=model_input,
+                embedding_function=embedding_function,
+                mcp_tools=mcp_tools,
+                user_id=user_id,
+            ):
+                if stream_event.delta:
+                    yield _sse_event("token", {"delta": stream_event.delta})
+                if stream_event.progress:
+                    yield _sse_event(
+                        "progress",
+                        {
+                            "message": stream_event.progress,
+                            "tools": stream_event.tool_names,
+                            "status": stream_event.tool_status,
+                        },
+                    )
+                if stream_event.result:
+                    result = stream_event.result
+
+            if result is None:
+                raise ValueError("Unified assistant stream ended without a final result")
+
+            yield _sse_event(
+                "metadata",
+                {
+                    "route": result.route,
+                    "sources": result.sources,
+                    "tools_used": result.tools_used,
+                },
+            )
+
+            with SessionLocal() as stream_db:
+                assistant_message = crud.create_chat_message(
+                    stream_db,
+                    session_id=session_id,
+                    role="assistant",
+                    content=result.answer,
+                    message_metadata={
+                        "model": "assistant",
+                        "streamed": True,
+                        "route": result.route,
+                        "sources": result.sources,
+                        "tools_used": result.tools_used,
+                    },
+                )
+                assistant_message_id = assistant_message.id
+        except Exception as exc:
+            yield _sse_event(
+                "error",
+                ai_sse_error_payload(
+                    logger=logger,
+                    operation="assistant_stream",
+                    exc=exc,
+                    default_code="assistant_service_unavailable",
+                    message="智能助手暂时不可用，请稍后重试",
+                ),
+            )
+            return
+
+        yield _sse_event(
+            "done",
+            {
+                "session_id": session_id,
+                "user_message_id": user_message_id,
+                "assistant_message_id": assistant_message_id,
+                "route": result.route,
+                "sources": result.sources,
+                "tools_used": result.tools_used,
+            },
+        )
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 
@@ -295,12 +417,14 @@ async def mcp_assistant(
         messages = result.get("messages", [])
         answer = _last_assistant_text(messages)
         tools_used = _tools_used(messages)
+        answer = _sanitize_mcp_answer(answer)
         if not answer:
             raise ValueError("MCP agent returned an empty response")
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
+    except Exception as exc:
+        raise_ai_http_exception(
+            logger=logger,
+            operation="mcp_assistant",
+            exc=exc,
             detail="MCP 工具助手暂时不可用，请稍后重试",
         )
 
@@ -345,10 +469,11 @@ def rag(request: RagRequest, db: Session = Depends(get_db)) -> RagResponse:
             answer=answer,
             sources=sources,
         )
-    except Exception:
-        traceback.print_exc()
-        raise HTTPException(
-            status_code=500,
+    except Exception as exc:
+        raise_ai_http_exception(
+            logger=logger,
+            operation="rag",
+            exc=exc,
             detail="文档问答服务暂时不可用",
         )
 
@@ -402,14 +527,16 @@ async def rag_stream(
                     },
                 )
                 assistant_message_id = assistant_message.id
-        except Exception:
-            traceback.print_exc()
+        except Exception as exc:
             yield _sse_event(
                 "error",
-                {
-                    "code": "rag_service_unavailable",
-                    "message": "文档问答服务暂时不可用",
-                },
+                ai_sse_error_payload(
+                    logger=logger,
+                    operation="rag_stream",
+                    exc=exc,
+                    default_code="rag_service_unavailable",
+                    message="文档问答服务暂时不可用",
+                ),
             )
             return
 

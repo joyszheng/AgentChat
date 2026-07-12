@@ -30,6 +30,7 @@ import { isAxiosError } from 'axios';
 
 import http from '@/lib/http/axios';
 import { isAdmin } from '@/lib/auth';
+import PageHeader from '@/components/PageHeader';
 
 
 interface MCPServer {
@@ -392,40 +393,32 @@ export default function MCPPage() {
 
   return (
     <div className="flex h-full flex-col bg-slate-50/70">
-      <header className="shrink-0 border-b border-slate-200 bg-white px-4 py-4 md:px-6">
-        <div className="mx-auto flex max-w-7xl flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex min-w-0 items-start gap-3">
-            <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-blue-50 text-blue-600">
-              <WorkflowIcon size={23} />
-            </div>
-            <div className="min-w-0">
-              <h1 className="text-xl font-semibold text-slate-900 md:text-2xl">MCP 工具接入</h1>
-              <p className="mt-1 text-sm leading-5 text-slate-500">
-                管理远程 Streamable HTTP 服务，发现工具并控制模型可用范围。
-              </p>
-            </div>
-          </div>
-          <div className="flex gap-2">
+      <PageHeader
+        title="MCP 工具接入"
+        description="管理远程 Streamable HTTP 服务，发现工具并控制模型可用范围。"
+        icon={<WorkflowIcon size={16} />}
+        actions={(
+          <div className="flex w-full gap-2 sm:w-auto">
             <button
               type="button"
               onClick={() => void reloadRegistry()}
               disabled={reloading}
-              className="inline-flex min-h-11 flex-1 cursor-pointer items-center justify-center gap-2 rounded-lg border border-slate-300 bg-white px-4 text-sm font-medium text-slate-700 transition-colors hover:bg-slate-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:cursor-not-allowed disabled:opacity-50 sm:flex-none"
+              className="inline-flex h-8 flex-1 cursor-pointer items-center justify-center gap-1.5 rounded-md border border-gray-200 bg-white px-3 text-xs font-medium text-gray-700 transition-colors hover:bg-gray-50 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:cursor-not-allowed disabled:opacity-50 sm:flex-none"
             >
-              <RefreshCwIcon size={17} className={reloading ? 'animate-spin' : ''} />
+              <RefreshCwIcon size={14} className={reloading ? 'animate-spin' : ''} />
               重新加载
             </button>
             <button
               type="button"
               onClick={openCreateModal}
-              className="inline-flex min-h-11 flex-1 cursor-pointer items-center justify-center gap-2 rounded-lg bg-blue-600 px-4 text-sm font-medium text-white shadow-sm transition-colors hover:bg-blue-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 sm:flex-none"
+              className="inline-flex h-8 flex-1 cursor-pointer items-center justify-center gap-1.5 rounded-md bg-blue-600 px-3 text-xs font-medium text-white shadow-sm transition-colors hover:bg-blue-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 sm:flex-none"
             >
-              <PlusIcon size={17} />
+              <PlusIcon size={14} />
               添加服务
             </button>
           </div>
-        </div>
-      </header>
+        )}
+      />
 
       <main className="flex-1 overflow-y-auto px-4 py-5 md:px-6 md:py-6">
         <div className="mx-auto max-w-7xl space-y-5">

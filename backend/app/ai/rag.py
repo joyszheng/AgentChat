@@ -231,6 +231,39 @@ def _upsert_documents(
     )
 
 
+def _vector_ids_exist(
+    ids: list[str],
+    *,
+    embedding_function=None,
+) -> bool:
+    if not ids:
+        return True
+
+    store = get_vector_store(embedding_function)
+    if not store.client.has_collection(collection_name=AGENTCHAT_MILVUS_COLLECTION):
+        return False
+
+    try:
+        records = store.client.get(
+            collection_name=AGENTCHAT_MILVUS_COLLECTION,
+            ids=ids,
+            output_fields=["pk"],
+            timeout=VECTOR_OPERATION_TIMEOUT,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[rag] Vector existence lookup failed collection=%s ids=%s error_type=%s error=%s",
+            AGENTCHAT_MILVUS_COLLECTION,
+            len(ids),
+            type(exc).__name__,
+            exc,
+        )
+        return False
+
+    found_ids = {str(record.get("pk")) for record in records if record.get("pk") is not None}
+    return set(ids).issubset(found_ids)
+
+
 def ensure_default_documents_indexed(embedding_function=None) -> None:
     global default_documents_indexed
 
@@ -238,6 +271,16 @@ def ensure_default_documents_indexed(embedding_function=None) -> None:
     # administrator switches to a different embedding configuration.
     get_vector_store(embedding_function)
     if default_documents_indexed:
+        return
+
+    default_chunk_ids = _chunk_ids(chunks)
+    if _vector_ids_exist(default_chunk_ids, embedding_function=embedding_function):
+        default_documents_indexed = True
+        logger.info(
+            "[rag] Default document indexing skipped reason=already_indexed documents=%s chunks=%s",
+            len(chunks),
+            len(default_chunk_ids),
+        )
         return
 
     logger.info("[rag] Default document indexing started documents=%s", len(chunks))

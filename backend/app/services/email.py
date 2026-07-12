@@ -3,7 +3,6 @@
 import logging
 from email.message import EmailMessage
 from pathlib import Path
-from typing import Any
 
 import aiosmtplib
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -27,6 +26,7 @@ class EmailSettings(BaseSettings):
     smtp_password: str = ""
     smtp_from_email: str = ""
     smtp_from_name: str = "AgentChat通知系统"
+    smtp_security: str = "auto"
     smtp_enabled: bool = True
 
 
@@ -62,6 +62,7 @@ async def send_email(
     smtp_password = config.get("smtp_password", email_settings.smtp_password)
     smtp_from_email = config.get("smtp_from_email", email_settings.smtp_from_email)
     smtp_from_name = config.get("smtp_from_name", email_settings.smtp_from_name)
+    smtp_security = str(config.get("smtp_security", email_settings.smtp_security)).lower()
 
     if not smtp_enabled:
         logger.info("[email] Email disabled, skipping send to=%s subject=%r", to, subject)
@@ -70,6 +71,11 @@ async def send_email(
     if not smtp_user or not smtp_password:
         logger.warning("[email] SMTP credentials not configured, skipping send")
         return False
+
+    if not smtp_from_email:
+        smtp_from_email = smtp_user
+
+    use_tls, start_tls = _resolve_smtp_tls(smtp_port, smtp_security)
 
     try:
         message = EmailMessage()
@@ -88,7 +94,9 @@ async def send_email(
             port=smtp_port,
             username=smtp_user,
             password=smtp_password,
-            use_tls=True,
+            use_tls=use_tls,
+            start_tls=start_tls,
+            timeout=30,
         )
 
         logger.info("[email] Email sent successfully to=%s subject=%r", to, subject)
@@ -124,7 +132,7 @@ def format_document_notification_email(
 
     size_mb = size_bytes / (1024 * 1024)
     body_lines = [
-        f"文档处理已完成，详情如下：\n",
+        "文档处理已完成，详情如下：\n",
         f"文件名：{original_filename}",
         f"文件大小：{size_mb:.2f} MB ({size_bytes:,} 字节)",
         f"上传时间：{created_at}",
@@ -133,20 +141,20 @@ def format_document_notification_email(
 
     if status == "indexed":
         body_lines.extend([
-            f"\n处理结果：",
+            "\n处理结果：",
             f"- 文档数量：{document_count}",
             f"- 文本分片数：{chunk_count}",
         ])
         if warnings:
-            body_lines.append(f"\n⚠️  警告信息：")
+            body_lines.append("\n⚠️  警告信息：")
             for warning in warnings:
                 body_lines.append(f"  - {warning}")
     elif status == "failed" and error_message:
         body_lines.append(f"\n错误信息：{error_message}")
 
     body_lines.extend([
-        f"\n---",
-        f"此邮件由 AgentChat 系统自动发送，请勿回复。",
+        "\n---",
+        "此邮件由 AgentChat 系统自动发送，请勿回复。",
     ])
 
     body = "\n".join(body_lines)
@@ -174,4 +182,20 @@ def get_email_config_from_db(db) -> dict:
         "smtp_password": config_service.get("smtp_password", ""),
         "smtp_from_email": config_service.get("smtp_from_email", ""),
         "smtp_from_name": config_service.get("smtp_from_name", "AgentChat通知系统"),
+        "smtp_security": config_service.get("smtp_security", "auto"),
     }
+
+
+def _resolve_smtp_tls(port: int, security: str) -> tuple[bool, bool | None]:
+    if security in {"ssl", "tls", "implicit_tls"}:
+        return True, None
+    if security in {"starttls", "start_tls"}:
+        return False, True
+    if security in {"none", "plain"}:
+        return False, False
+
+    if port == 465:
+        return True, None
+    if port == 587:
+        return False, True
+    return False, None

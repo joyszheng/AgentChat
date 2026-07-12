@@ -9,6 +9,12 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
 type ChatMode = 'auto' | 'chat' | 'rag' | 'mcp';
+type ToolCallStatus = 'running' | 'completed' | 'failed';
+
+interface ToolCallState {
+  name: string;
+  status: ToolCallStatus;
+}
 
 interface ChatMessageItem {
   id: string;
@@ -16,9 +22,11 @@ interface ChatMessageItem {
   content: string;
   sources?: string[];
   toolsUsed?: string[];
+  toolCalls?: ToolCallState[];
   mode?: ChatMode;
   route?: string;
   loading?: boolean;
+  streamStatus?: string;
 }
 
 interface ChatSessionItem {
@@ -37,14 +45,6 @@ interface ApiChatMessage {
     sources?: string[];
     tools_used?: string[];
   };
-}
-
-interface AssistantResponse {
-  answer: string;
-  session_id: number;
-  route?: string;
-  sources?: string[];
-  tools_used?: string[];
 }
 
 interface MCPAssistantResponse {
@@ -73,6 +73,27 @@ const getErrorDetail = (error: unknown, fallback: string) => {
     return response?.data?.detail || fallback;
   }
   return error instanceof Error ? error.message : fallback;
+};
+
+const getStreamHeaders = () => {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const token = typeof window !== 'undefined' ? localStorage.getItem('access_token') : null;
+  if (token) {
+    headers.Authorization = `Bearer ${token}`;
+  }
+  return headers;
+};
+
+const mergeToolCalls = (
+  current: ToolCallState[] | undefined,
+  toolNames: string[],
+  status: ToolCallStatus,
+) => {
+  const byName = new Map((current || []).map((item) => [item.name, item]));
+  for (const name of toolNames) {
+    byName.set(name, { name, status });
+  }
+  return Array.from(byName.values());
 };
 
 const getGroupName = (timeStr: string | null | undefined) => {
@@ -184,6 +205,10 @@ export default function ChatPage() {
         route: m.message_metadata?.route,
         sources: m.message_metadata?.sources || [],
         toolsUsed: m.message_metadata?.tools_used || [],
+        toolCalls: (m.message_metadata?.tools_used || []).map((name) => ({
+          name,
+          status: 'completed' as const,
+        })),
       }));
       setMessages(formatted.length ? formatted : [{ id: 'welcome', role: 'assistant', content: '你好，我是 AgentChat，请问有什么可以帮你？' }]);
     } catch {
@@ -226,6 +251,9 @@ export default function ChatPage() {
         content: '',
         sources: [],
         toolsUsed: [],
+        toolCalls: chatMode === 'mcp'
+          ? [{ name: 'MCP 工具', status: 'running' }]
+          : [],
         mode: chatMode,
         loading: true,
       }
@@ -236,30 +264,106 @@ export default function ChatPage() {
     if (chatMode === 'auto') {
       let createdNewSession = false;
       try {
-        const res = await http.post<AssistantResponse, AssistantResponse>('/ai/assistant', {
-          message: text,
-          session_id: sessionIdRef.current,
+        const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/ai/assistant/stream`, {
+          method: 'POST',
+          headers: getStreamHeaders(),
+          body: JSON.stringify({ message: text, session_id: sessionIdRef.current }),
         });
 
-        if (sessionIdRef.current !== res.session_id) {
-          setSessionId(res.session_id);
-          sessionIdRef.current = res.session_id;
-          createdNewSession = true;
+        if (!res.ok) {
+          throw new Error('智能助手请求失败');
         }
+        if (!res.body) throw new Error('No stream body');
 
-        setMessages((prev) => prev.map((msg) =>
-          msg.id === assistantMsgId
-            ? {
-                ...msg,
-                content: res.answer,
-                route: res.route,
-                sources: res.sources || [],
-                toolsUsed: res.tools_used || [],
-                loading: false,
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let currentEvent = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+
+          const lines = buffer.split('\n');
+          buffer = lines.pop() || '';
+
+          for (const line of lines) {
+            if (line.startsWith('event: ')) {
+              currentEvent = line.slice(7).trim();
+            } else if (line.startsWith('data: ')) {
+              const dataStr = line.slice(6).trim();
+              if (!dataStr) continue;
+
+              try {
+                const data = JSON.parse(dataStr);
+                if (currentEvent === 'token' && data.delta) {
+                  setMessages((prev) => prev.map((msg) =>
+                    msg.id === assistantMsgId
+                      ? {
+                          ...msg,
+                          content: msg.content + data.delta,
+                          loading: false,
+                          streamStatus: undefined,
+                        }
+                      : msg
+                  ));
+                } else if (currentEvent === 'metadata' || currentEvent === 'done') {
+                  setMessages((prev) => prev.map((msg) =>
+                    msg.id === assistantMsgId
+                      ? {
+                          ...msg,
+                          route: data.route ?? msg.route,
+                          sources: data.sources || msg.sources || [],
+                          toolsUsed: data.tools_used || msg.toolsUsed || [],
+                          toolCalls: data.tools_used
+                            ? mergeToolCalls(msg.toolCalls, data.tools_used, 'completed')
+                            : msg.toolCalls,
+                        }
+                      : msg
+                  ));
+                } else if (currentEvent === 'progress' && data.message) {
+                  setMessages((prev) => prev.map((msg) =>
+                    msg.id === assistantMsgId
+                      ? {
+                          ...msg,
+                          streamStatus: data.message,
+                          toolCalls: Array.isArray(data.tools)
+                            ? mergeToolCalls(
+                                msg.toolCalls,
+                                data.tools,
+                                data.status === 'completed' ? 'completed' : 'running',
+                              )
+                            : msg.toolCalls,
+                        }
+                      : msg
+                  ));
+                } else if (currentEvent === 'start' && data.session_id) {
+                  if (sessionIdRef.current !== data.session_id) {
+                    setSessionId(data.session_id);
+                    sessionIdRef.current = data.session_id;
+                    createdNewSession = true;
+                  }
+                } else if (currentEvent === 'error') {
+                  message.error(data.message || '智能助手请求失败');
+                  setMessages((prev) => prev.map((msg) =>
+                    msg.id === assistantMsgId
+                      ? {
+                          ...msg,
+                          content: data.message || '智能助手暂时不可用，请稍后重试。',
+                          loading: false,
+                        }
+                      : msg
+                  ));
+                }
+              } catch (e) {
+                console.error('Failed to parse SSE data', e);
               }
-            : msg
-        ));
+            }
+          }
+        }
       } catch (e) {
+        console.error(e);
         message.error(getErrorDetail(e, '智能助手请求失败'));
         setMessages((prev) => prev.map((msg) =>
           msg.id === assistantMsgId
@@ -376,6 +480,9 @@ export default function ChatPage() {
                 ...msg,
                 content: res.answer,
                 toolsUsed: res.tools_used || [],
+                toolCalls: (res.tools_used && res.tools_used.length > 0)
+                  ? res.tools_used.map((name) => ({ name, status: 'completed' as const }))
+                  : mergeToolCalls(msg.toolCalls, ['MCP 工具'], 'completed'),
                 loading: false,
               }
             : msg
@@ -387,6 +494,7 @@ export default function ChatPage() {
             ? {
                 ...msg,
                 content: 'MCP 工具助手暂时不可用，请确认已启用可用工具并稍后重试。',
+                toolCalls: mergeToolCalls(msg.toolCalls, ['MCP 工具'], 'failed'),
                 loading: false,
               }
             : msg
@@ -468,6 +576,43 @@ export default function ChatPage() {
         fetchSessions(true);
       }
     }
+  };
+
+  const renderToolCards = (toolCalls?: ToolCallState[]) => {
+    if (!toolCalls || toolCalls.length === 0) return null;
+
+    return (
+      <div className="mb-3 flex flex-col gap-1.5">
+        {toolCalls.map((tool) => {
+          const completed = tool.status === 'completed';
+          const failed = tool.status === 'failed';
+          return (
+            <div
+              key={tool.name}
+              className={`flex max-w-full items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs ${
+                failed
+                  ? 'border-red-100 bg-red-50/70 text-red-800'
+                  : completed
+                    ? 'border-emerald-100 bg-emerald-50/70 text-emerald-800'
+                    : 'border-blue-100 bg-blue-50/70 text-blue-800'
+              }`}
+            >
+              <span
+                className={`h-2 w-2 shrink-0 rounded-full ${
+                  failed ? 'bg-red-500' : completed ? 'bg-emerald-500' : 'animate-pulse bg-blue-500'
+                }`}
+              />
+              <span className="shrink-0 font-medium">
+                {failed ? '调用失败' : completed ? '调用完成' : '调用中'}
+              </span>
+              <span className="min-w-0 truncate font-mono text-[11px]">
+                {tool.name}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+    );
   };
 
   const renderSidebar = () => (
@@ -575,8 +720,11 @@ export default function ChatPage() {
               key={msg.id}
               loading={msg.loading}
               loadingRender={() => (
-                <div className="text-gray-400 text-sm animate-pulse flex items-center gap-2">
-                  {msg.mode === 'auto' ? '智能助手处理中...' : msg.mode === 'mcp' ? 'MCP 工具助手处理中...' : 'AI 思考中...'}
+                <div>
+                  {renderToolCards(msg.toolCalls)}
+                  <div className="text-gray-400 text-sm animate-pulse flex items-center gap-2">
+                    {msg.streamStatus || (msg.mode === 'auto' ? '智能助手处理中...' : msg.mode === 'mcp' ? 'MCP 工具助手处理中...' : 'AI 思考中...')}
+                  </div>
                 </div>
               )}
               placement={msg.role === 'user' ? 'end' : 'start'}
@@ -600,6 +748,7 @@ export default function ChatPage() {
                   msg.content
                 ) : (
                   <>
+                    {renderToolCards(msg.toolCalls)}
                     <div className="prose prose-sm max-w-none text-gray-800 break-words [&>p]:mb-0 [&>*:first-child]:mt-0 [&>*:last-child]:mb-0">
                       <ReactMarkdown remarkPlugins={[remarkGfm]}>{msg.content}</ReactMarkdown>
                     </div>
@@ -622,21 +771,11 @@ export default function ChatPage() {
                         ]}
                       />
                     )}
-                    {(msg.route || (msg.toolsUsed && msg.toolsUsed.length > 0)) && (
+                    {msg.route && (
                       <div className="mt-3 flex flex-wrap items-center gap-1.5 border-t border-gray-100 pt-2">
-                        {msg.route && (
-                          <Tag color="geekblue" className="m-0 max-w-full truncate font-mono text-xs">
-                            {msg.route}
-                          </Tag>
-                        )}
-                        {msg.toolsUsed && msg.toolsUsed.length > 0 && (
-                          <span className="text-xs font-medium text-gray-500">调用工具</span>
-                        )}
-                        {msg.toolsUsed?.map((toolName: string) => (
-                          <Tag key={toolName} color="blue" className="m-0 max-w-full truncate font-mono text-xs">
-                            {toolName}
-                          </Tag>
-                        ))}
+                        <Tag color="geekblue" className="m-0 max-w-full truncate font-mono text-xs">
+                          {msg.route}
+                        </Tag>
                       </div>
                     )}
                   </>

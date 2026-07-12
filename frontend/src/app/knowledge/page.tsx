@@ -6,6 +6,7 @@ import { RefreshCwIcon, ArchiveIcon, DeleteIcon, DownloadIcon } from 'lucide-ani
 import { useRequest } from 'ahooks';
 import http from '@/lib/http/axios';
 import { isAuthenticated } from '@/lib/auth';
+import PageHeader from '@/components/PageHeader';
 import type { UploadProps } from 'antd';
 
 const { Dragger } = Upload;
@@ -293,18 +294,25 @@ export default function KnowledgePage() {
   );
 
   return (
-    <div className="p-4 md:p-6 h-full flex flex-col bg-gray-50/50">
-      <div className="flex justify-between items-center mb-4 md:mb-6">
-        <h1 className="text-xl md:text-2xl font-bold text-gray-800">知识库管理</h1>
-        <div 
-          onClick={loading ? undefined : fetchDocuments}
-          className={`flex items-center gap-1.5 px-3 md:px-4 h-7 md:h-8 rounded-md bg-[#1677ff] hover:bg-[#4096ff] text-white cursor-pointer transition-colors text-sm ${loading ? 'opacity-70 cursor-not-allowed' : ''}`}
-        >
-          <RefreshCwIcon size={16} className={loading ? 'animate-spin' : ''} />
-          <span>刷新状态</span>
-        </div>
-      </div>
+    <div className="flex h-full flex-col bg-gray-50/50">
+      <PageHeader
+        title="知识库管理"
+        description="上传、解析并维护可供检索的文档资料。"
+        icon={<ArchiveIcon size={16} />}
+        actions={(
+          <button
+            type="button"
+            onClick={loading ? undefined : fetchDocuments}
+            disabled={loading}
+            className="inline-flex h-8 cursor-pointer items-center gap-1.5 rounded-md bg-blue-600 px-3 text-xs font-medium text-white transition-colors hover:bg-blue-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-600 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            <RefreshCwIcon size={14} className={loading ? 'animate-spin' : ''} />
+            <span>刷新状态</span>
+          </button>
+        )}
+      />
       
+      <div className="flex min-h-0 flex-1 flex-col p-4 md:p-6">
       <div className="mb-4 md:mb-6 bg-white rounded-xl overflow-hidden shadow-sm border border-gray-100 p-2">
         <Dragger {...uploadProps} showUploadList={false} className="py-2 md:py-8">
           <div className="ant-upload-drag-icon text-blue-500 mb-2 md:mb-4 flex justify-center">
@@ -317,7 +325,7 @@ export default function KnowledgePage() {
         </Dragger>
       </div>
 
-      <div className="flex-1 overflow-auto">
+      <div className="min-h-0 flex-1 overflow-auto">
         {/* Desktop Table */}
         <div className="hidden md:block bg-white rounded-xl p-2 border border-gray-100 shadow-sm h-full">
           <Table 
@@ -344,6 +352,7 @@ export default function KnowledgePage() {
             </div>
           )}
         </div>
+      </div>
       </div>
     </div>
   );
