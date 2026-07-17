@@ -12,8 +12,9 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from pymilvus import MilvusClient, connections
 
 from .chains import create_rag_chain
-from .document_processing import ProcessedDocument, load_upload_documents
+from .document_processing import DocumentProcessingError, ProcessedDocument, load_upload_documents
 from .models import embeddings as default_embeddings
+from ..services.upload_policy import get_document_max_chunks
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -310,6 +311,12 @@ def add_documents_to_index(
         CHUNK_OVERLAP,
     )
     chunks = splitter.split_documents(documents)
+    max_chunks = get_document_max_chunks()
+    if len(chunks) > max_chunks:
+        raise DocumentProcessingError(
+            f"Document produces too many chunks: {len(chunks)} exceeds the limit of "
+            f"{max_chunks}. Please split the file and upload again."
+        )
     _tag_chunks_metadata(chunks, document_id=document_id)
     chunk_lengths = [len(chunk.page_content) for chunk in chunks]
     logger.info(

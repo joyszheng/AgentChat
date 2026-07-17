@@ -26,7 +26,9 @@ SCHEDULER_BATCH_SIZE = 5
 # reaper 租约阈值：running 需 > worker job_timeout(600) 以免误伤仍在执行的任务。
 STUCK_RUNNING_TIMEOUT_SECONDS = int(os.getenv("TASK_STUCK_RUNNING_TIMEOUT_SECONDS", "900"))
 STUCK_QUEUED_TIMEOUT_SECONDS = int(os.getenv("TASK_STUCK_QUEUED_TIMEOUT_SECONDS", "1800"))
-EMAIL_PATTERN = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
+EMAIL_PATTERN = re.compile(
+    r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+"
+)
 
 # 定时任务执行器的系统提示：复用统一助手的工具装配，但带"授权执行器"语气。
 TASK_EXECUTOR_SYSTEM_PROMPT = (

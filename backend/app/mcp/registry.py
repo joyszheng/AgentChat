@@ -4,9 +4,11 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import Any
 
 from langchain_core.tools import BaseTool, StructuredTool
@@ -15,6 +17,8 @@ from sqlalchemy.orm import Session
 
 from .. import models, schemas
 from ..database import SessionLocal
+from .config import resolve_transport_config
+from .transports import build_mcp_connection
 from ..services.encryption import decrypt_value
 
 
@@ -22,6 +26,9 @@ logger = logging.getLogger("uvicorn.error")
 _TOOL_NAME_PATTERN = re.compile(r"[^a-zA-Z0-9_-]+")
 _MAX_TOOL_NAME_LENGTH = 64
 _TRUNCATED_RESULT_MARKER = "\n[结果过长，已截断]"
+_DEFAULT_REFRESH_CONCURRENCY = 4
+_DEFAULT_STALE_TTL_SECONDS = 300
+_DEFAULT_SYNC_INTERVAL_SECONDS = 5.0
 
 
 @dataclass(frozen=True)
@@ -49,89 +56,127 @@ class RegisteredMCPTool:
         )
 
 
+@dataclass(frozen=True)
+class MCPServerSnapshot:
+    """Last successfully loaded runtime state for one MCP server."""
+
+    server_id: int
+    client: MultiServerMCPClient
+    tools: tuple[RegisteredMCPTool, ...]
+    config_revision: int
+    loaded_at: datetime
+    stale_since: datetime | None = None
+
+
 class MCPRegistry:
     """Load remote MCP tools once and provide role-filtered views per request."""
 
     def __init__(self) -> None:
-        self._lock = asyncio.Lock()
+        self._state_lock = asyncio.Lock()
+        self._server_locks: dict[int, asyncio.Lock] = {}
+        self._snapshots: dict[int, MCPServerSnapshot] = {}
         self._tools: dict[str, RegisteredMCPTool] = {}
         self._clients: dict[int, MultiServerMCPClient] = {}
+        self._observed_revision = 0
+        self._stale_ttl_seconds = int(
+            os.getenv("MCP_STALE_TTL_SECONDS", str(_DEFAULT_STALE_TTL_SECONDS))
+        )
 
     async def refresh(self) -> None:
-        """Reload every enabled server without making MCP availability block startup."""
+        """Reload all servers concurrently while isolating per-server failures."""
 
-        async with self._lock:
-            with SessionLocal() as db:
-                server_ids = [
-                    server.id
-                    for server in db.query(models.MCPServer).order_by(models.MCPServer.id).all()
-                ]
+        with SessionLocal() as db:
+            server_ids = [
+                server.id
+                for server in db.query(models.MCPServer).order_by(models.MCPServer.id).all()
+            ]
+            revision = self._config_state_revision(db)
 
-            new_tools: dict[str, RegisteredMCPTool] = {}
-            new_clients: dict[int, MultiServerMCPClient] = {}
+        semaphore = asyncio.Semaphore(_DEFAULT_REFRESH_CONCURRENCY)
 
-            for server_id in server_ids:
-                server_name = str(server_id)
-                try:
-                    with SessionLocal() as db:
-                        server = db.get(models.MCPServer, server_id)
-                        if server is None:
-                            continue
-                        server_name = server.name
-                        if not server.enabled:
-                            self._set_status(
-                                db,
-                                server,
-                                status="disabled",
-                                error=None,
-                            )
-                            continue
+        async def reload_one(server_id: int) -> None:
+            async with semaphore:
+                await self.reload_server(server_id)
 
-                        config = self._server_config(server)
-                        policy = self._server_policy(server)
+        await asyncio.gather(*(reload_one(server_id) for server_id in server_ids))
+        await self._remove_missing_servers(set(server_ids))
+        await self._expire_stale_snapshots()
+        self._observed_revision = revision
 
-                    client, source_tools = await self._load_source_tools(config)
-                    registered = self._register_tools(policy, source_tools)
-                    new_clients[server_id] = client
-                    for item in registered:
-                        if item.qualified_name in new_tools:
-                            raise RuntimeError(
-                                f"MCP 工具名称冲突：{item.qualified_name}"
-                            )
-                        new_tools[item.qualified_name] = item
+    async def reload_server(self, server_id: int) -> bool:
+        """Reload one server and atomically publish its new tool snapshot."""
 
-                    with SessionLocal() as db:
-                        current = db.get(models.MCPServer, server_id)
-                        if current is not None:
-                            current.discovered_tools = sorted(
-                                {item.source_name for item in registered}
-                            )
-                            self._set_status(db, current, status="healthy", error=None)
-                    logger.info(
-                        "[mcp] Server loaded name=%s tools=%s exposed=%s",
-                        policy["name"],
-                        len(registered),
-                        sum(item.enabled for item in registered),
-                    )
-                except Exception as exc:
-                    logger.exception(
-                        "[mcp] Server load failed id=%s name=%s error=%s",
-                        server_id,
-                        server_name,
-                        exc,
-                    )
-                    with SessionLocal() as db:
-                        current = db.get(models.MCPServer, server_id)
-                        if current is not None:
-                            self._set_status(
-                                db,
-                                current,
-                                status="unhealthy",
-                                error=str(exc),
-                            )
+        lock = self._server_locks.setdefault(server_id, asyncio.Lock())
+        async with lock:
+            server_name = str(server_id)
+            try:
+                with SessionLocal() as db:
+                    server = db.get(models.MCPServer, server_id)
+                    if server is None:
+                        await self.remove_server(server_id)
+                        return False
+                    server_name = server.name
+                    if not server.enabled:
+                        self._set_status(db, server, status="disabled", error=None)
+                        await self.remove_server(server_id)
+                        return True
+                    config = self._server_config(server)
+                    policy = self._server_policy(server)
+                    config_revision = server.config_revision
 
-            self._tools = new_tools
-            self._clients = new_clients
+                client, source_tools = await self._load_source_tools(config)
+                registered = tuple(self._register_tools(policy, source_tools))
+                snapshot = MCPServerSnapshot(
+                    server_id=server_id,
+                    client=client,
+                    tools=registered,
+                    config_revision=config_revision,
+                    loaded_at=datetime.now(timezone.utc),
+                )
+                await self._publish_snapshot(snapshot)
+
+                with SessionLocal() as db:
+                    current = db.get(models.MCPServer, server_id)
+                    if current is not None:
+                        current.discovered_tools = sorted(
+                            {item.source_name for item in registered}
+                        )
+                        current.active_revision = config_revision
+                        self._set_status(db, current, status="healthy", error=None)
+                logger.info(
+                    "[mcp] Server loaded name=%s tools=%s exposed=%s revision=%s",
+                    policy["name"],
+                    len(registered),
+                    sum(item.enabled for item in registered),
+                    config_revision,
+                )
+                return True
+            except Exception as exc:
+                logger.exception(
+                    "[mcp] Server load failed id=%s name=%s error=%s",
+                    server_id,
+                    server_name,
+                    exc,
+                )
+                kept_snapshot = await self._mark_snapshot_stale(server_id)
+                with SessionLocal() as db:
+                    current = db.get(models.MCPServer, server_id)
+                    if current is not None:
+                        self._set_status(
+                            db,
+                            current,
+                            status="stale" if kept_snapshot else "unhealthy",
+                            error=str(exc),
+                        )
+                return False
+
+    async def remove_server(self, server_id: int) -> None:
+        """Remove one server from the published runtime snapshot."""
+
+        async with self._state_lock:
+            snapshots = dict(self._snapshots)
+            snapshots.pop(server_id, None)
+            self._publish_runtime_state(snapshots)
 
     async def test_server(self, server_id: int) -> list[schemas.MCPToolInfo]:
         """Connect to one server and discover tools without exposing them globally."""
@@ -217,12 +262,153 @@ class MCPRegistry:
         duration_ms = round((time.perf_counter() - started_at) * 1000)
         return result, duration_ms
 
+    async def sync_if_changed(self) -> bool:
+        """Reload only servers whose persisted configuration changed."""
+
+        with SessionLocal() as db:
+            revision = self._config_state_revision(db)
+            rows = db.query(
+                models.MCPServer.id,
+                models.MCPServer.config_revision,
+                models.MCPServer.enabled,
+            ).all()
+
+        stale_ids = {
+            server_id
+            for server_id, snapshot in self._snapshots.items()
+            if snapshot.stale_since is not None
+        }
+        if revision == self._observed_revision and not stale_ids:
+            await self._expire_stale_snapshots()
+            return False
+
+        current_ids = {row.id for row in rows}
+        await self._remove_missing_servers(current_ids)
+        changed_ids = [
+            row.id
+            for row in rows
+            if (
+                (snapshot := self._snapshots.get(row.id)) is None
+                or snapshot.config_revision != row.config_revision
+                or snapshot.stale_since is not None
+                or not row.enabled
+            )
+        ]
+
+        semaphore = asyncio.Semaphore(_DEFAULT_REFRESH_CONCURRENCY)
+
+        async def reload_one(server_id: int) -> None:
+            async with semaphore:
+                await self.reload_server(server_id)
+
+        await asyncio.gather(*(reload_one(server_id) for server_id in changed_ids))
+        await self._expire_stale_snapshots()
+        self._observed_revision = revision
+        return bool(changed_ids)
+
+    async def watch_config_changes(
+        self,
+        *,
+        stop_event: asyncio.Event,
+        interval_seconds: float = _DEFAULT_SYNC_INTERVAL_SECONDS,
+    ) -> None:
+        """Poll the durable revision so every process converges after config changes."""
+
+        while not stop_event.is_set():
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=interval_seconds)
+            except asyncio.TimeoutError:
+                try:
+                    await self.sync_if_changed()
+                except Exception:
+                    logger.exception("[mcp] Config revision synchronization failed")
+
     async def close(self) -> None:
         """Drop runtime references; adapter clients use short-lived sessions by default."""
 
-        async with self._lock:
+        async with self._state_lock:
+            self._snapshots = {}
             self._tools = {}
             self._clients = {}
+            self._server_locks = {}
+
+    async def _publish_snapshot(self, snapshot: MCPServerSnapshot) -> None:
+        async with self._state_lock:
+            snapshots = dict(self._snapshots)
+            snapshots[snapshot.server_id] = snapshot
+            self._publish_runtime_state(snapshots)
+
+    async def _mark_snapshot_stale(self, server_id: int) -> bool:
+        async with self._state_lock:
+            snapshot = self._snapshots.get(server_id)
+            if snapshot is None:
+                return False
+            stale_since = snapshot.stale_since or datetime.now(timezone.utc)
+            snapshots = dict(self._snapshots)
+            snapshots[server_id] = replace(snapshot, stale_since=stale_since)
+            self._publish_runtime_state(snapshots)
+            return True
+
+    async def _remove_missing_servers(self, current_ids: set[int]) -> None:
+        async with self._state_lock:
+            snapshots = {
+                server_id: snapshot
+                for server_id, snapshot in self._snapshots.items()
+                if server_id in current_ids
+            }
+            self._publish_runtime_state(snapshots)
+
+    async def _expire_stale_snapshots(self) -> None:
+        now = datetime.now(timezone.utc)
+        expired_ids = {
+            server_id
+            for server_id, snapshot in self._snapshots.items()
+            if snapshot.stale_since is not None
+            and (now - snapshot.stale_since).total_seconds() >= self._stale_ttl_seconds
+        }
+        if not expired_ids:
+            return
+
+        async with self._state_lock:
+            snapshots = {
+                server_id: snapshot
+                for server_id, snapshot in self._snapshots.items()
+                if server_id not in expired_ids
+            }
+            self._publish_runtime_state(snapshots)
+
+        with SessionLocal() as db:
+            for server_id in expired_ids:
+                server = db.get(models.MCPServer, server_id)
+                if server is not None and server.enabled:
+                    self._set_status(
+                        db,
+                        server,
+                        status="unhealthy",
+                        error="MCP stale 工具快照已过期",
+                    )
+
+    def _publish_runtime_state(
+        self,
+        snapshots: dict[int, MCPServerSnapshot],
+    ) -> None:
+        tools: dict[str, RegisteredMCPTool] = {}
+        for snapshot in snapshots.values():
+            for item in snapshot.tools:
+                if item.qualified_name in tools:
+                    raise RuntimeError(f"MCP 工具名称冲突：{item.qualified_name}")
+                tools[item.qualified_name] = item
+        self._snapshots = snapshots
+        self._tools = tools
+        self._clients = {
+            server_id: snapshot.client
+            for server_id, snapshot in snapshots.items()
+        }
+
+    @staticmethod
+    def _config_state_revision(db: Session) -> int:
+        state = db.get(models.MCPConfigState, 1)
+        return state.revision if state is not None else 0
 
     async def _load_source_tools(
         self,
@@ -242,7 +428,10 @@ class MCPRegistry:
         registered: list[RegisteredMCPTool] = []
 
         for source_tool in source_tools:
-            qualified_name = _qualified_tool_name(policy["name"], source_tool.name)
+            qualified_name = _qualified_tool_name(
+                policy.get("namespace") or policy["name"],
+                source_tool.name,
+            )
             enabled = allow_all or source_tool.name in allowed_tools
             wrapped = _wrap_tool(
                 source_tool,
@@ -278,13 +467,13 @@ class MCPRegistry:
                 raise ValueError("MCP 认证 Headers 格式无效")
             headers = loaded
 
-        connection: dict[str, Any] = {
-            "transport": "streamable_http",
-            "url": server.url,
-            "timeout": float(server.call_timeout_seconds),
-        }
-        if headers:
-            connection["headers"] = headers
+        canonical = resolve_transport_config(
+            transport_config=server.transport_config,
+            legacy_transport=server.transport,
+            legacy_url=server.url,
+            legacy_timeout_seconds=server.call_timeout_seconds,
+        )
+        connection = build_mcp_connection(canonical, headers=headers)
         return {"name": server.name, "connection": connection}
 
     @staticmethod
@@ -292,6 +481,7 @@ class MCPRegistry:
         return {
             "id": server.id,
             "name": server.name,
+            "namespace": server.namespace or server.name,
             "require_admin": server.require_admin,
             "allowed_tools": list(server.allowed_tools or []),
             "call_timeout_seconds": server.call_timeout_seconds,
@@ -309,8 +499,11 @@ class MCPRegistry:
         from sqlalchemy import func
 
         server.last_health_status = status
+        server.catalog_status = status
         server.last_error = error[:4000] if error else None
         server.last_checked_at = func.now()
+        if status == "healthy":
+            server.catalog_updated_at = func.now()
         db.add(server)
         db.commit()
 

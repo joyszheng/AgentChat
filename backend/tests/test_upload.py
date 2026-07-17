@@ -14,7 +14,7 @@ def test_upload_indexes_saved_file(monkeypatch, tmp_path):
     main_module = _load_main_with_fake_rag(monkeypatch, tmp_path)
     upload_dir = tmp_path / "uploads"
     upload_dir.mkdir()
-    monkeypatch.setattr(main_module, "UPLOAD_DIR", upload_dir)
+    monkeypatch.setattr(_documents_router(), "UPLOAD_DIR", upload_dir)
     reported_stages = []
 
     def fake_ingest_upload(
@@ -46,7 +46,7 @@ def test_upload_indexes_saved_file(monkeypatch, tmp_path):
             1,
         )
 
-    monkeypatch.setattr(main_module, "ingest_upload", fake_ingest_upload)
+    monkeypatch.setattr(_document_ingestion(), "ingest_upload", fake_ingest_upload)
 
     response = TestClient(main_module.app).post(
         "/upload",
@@ -111,7 +111,7 @@ def test_upload_indexes_saved_file(monkeypatch, tmp_path):
         return 1
 
     monkeypatch.setattr(
-        main_module,
+        _documents_router(),
         "delete_document_from_index",
         fake_delete_document_from_index,
     )
@@ -146,12 +146,12 @@ def test_background_upload_records_document_processing_failure(monkeypatch, tmp_
     main_module = _load_main_with_fake_rag(monkeypatch, tmp_path)
     upload_dir = tmp_path / "uploads"
     upload_dir.mkdir()
-    monkeypatch.setattr(main_module, "UPLOAD_DIR", upload_dir)
+    monkeypatch.setattr(_documents_router(), "UPLOAD_DIR", upload_dir)
 
     def fake_ingest_upload(*_args, **_kwargs):
         raise DocumentProcessingError("未提取到可用文本，当前版本暂未启用 OCR")
 
-    monkeypatch.setattr(main_module, "ingest_upload", fake_ingest_upload)
+    monkeypatch.setattr(_document_ingestion(), "ingest_upload", fake_ingest_upload)
 
     response = TestClient(main_module.app).post(
         "/upload",
@@ -189,7 +189,7 @@ def test_upload_rejects_same_filename_and_same_content(monkeypatch, tmp_path):
     main_module = _load_main_with_fake_rag(monkeypatch, tmp_path)
     upload_dir = tmp_path / "uploads"
     upload_dir.mkdir()
-    monkeypatch.setattr(main_module, "UPLOAD_DIR", upload_dir)
+    monkeypatch.setattr(_documents_router(), "UPLOAD_DIR", upload_dir)
 
     client = TestClient(main_module.app)
     first_response = client.post(
@@ -215,11 +215,50 @@ def test_upload_rejects_same_filename_and_same_content(monkeypatch, tmp_path):
     assert len(list(upload_dir.iterdir())) == 2
 
 
+def test_upload_policy_returns_configured_limits(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENTCHAT_UPLOAD_MAX_TEXT_BYTES", "1234")
+    monkeypatch.setenv("AGENTCHAT_DOCUMENT_MAX_TEXT_CHARS", "5678")
+    monkeypatch.setenv("AGENTCHAT_DOCUMENT_MAX_CHUNKS", "90")
+    main_module = _load_main_with_fake_rag(monkeypatch, tmp_path)
+
+    response = TestClient(main_module.app).get("/documents/upload-policy")
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["allowed_extensions"] == [".pdf", ".docx", ".md", ".txt"]
+    assert data["type_limits"][".txt"] == 1234
+    assert data["type_limits"][".md"] == 1234
+    assert data["document_max_text_chars"] == 5678
+    assert data["document_max_chunks"] == 90
+
+
+def test_upload_rejects_file_that_exceeds_streaming_limit(monkeypatch, tmp_path):
+    monkeypatch.setenv("AGENTCHAT_UPLOAD_MAX_TEXT_BYTES", "5")
+    monkeypatch.setenv("AGENTCHAT_UPLOAD_CHUNK_READ_BYTES", "3")
+    main_module = _load_main_with_fake_rag(monkeypatch, tmp_path)
+    upload_dir = tmp_path / "uploads"
+    upload_dir.mkdir()
+    monkeypatch.setattr(_documents_router(), "UPLOAD_DIR", upload_dir)
+
+    client = TestClient(main_module.app)
+    response = client.post(
+        "/upload",
+        files={"file": ("too-large.txt", b"123456", "text/plain")},
+    )
+
+    assert response.status_code == 413
+    assert response.json()["detail"]["code"] == "upload_too_large"
+    assert response.json()["detail"]["max_bytes"] == 5
+    assert response.json()["detail"]["actual_bytes"] == 6
+    assert list(upload_dir.iterdir()) == []
+    assert client.get("/documents").json() == []
+
+
 def test_upload_rejects_unsupported_format_before_saving(monkeypatch, tmp_path):
     main_module = _load_main_with_fake_rag(monkeypatch, tmp_path)
     upload_dir = tmp_path / "uploads"
     upload_dir.mkdir()
-    monkeypatch.setattr(main_module, "UPLOAD_DIR", upload_dir)
+    monkeypatch.setattr(_documents_router(), "UPLOAD_DIR", upload_dir)
 
     client = TestClient(main_module.app)
     response = client.post(
@@ -245,7 +284,7 @@ def test_delete_document_rejects_active_processing(monkeypatch, tmp_path):
     database = importlib.import_module("app.database")
     upload_dir = tmp_path / "uploads"
     upload_dir.mkdir()
-    monkeypatch.setattr(main_module, "UPLOAD_DIR", upload_dir)
+    monkeypatch.setattr(_documents_router(), "UPLOAD_DIR", upload_dir)
     file_path = upload_dir / "processing.txt"
     file_path.write_text("processing", encoding="utf-8")
 
@@ -271,7 +310,7 @@ def test_delete_document_rejects_active_processing(monkeypatch, tmp_path):
     assert file_path.exists()
     assert len(TestClient(main_module.app).get("/documents").json()) == 1
 
-    monkeypatch.setattr(main_module, "DOCUMENT_PROGRESS_STREAM_LIFETIME", 0)
+    monkeypatch.setattr(_documents_router(), "DOCUMENT_PROGRESS_STREAM_LIFETIME", 0)
     progress_response = TestClient(main_module.app).get(
         f"/documents/{document_id}/progress"
     )
@@ -322,6 +361,9 @@ def _parse_sse_events(body: str) -> list[dict]:
 def _load_main_with_fake_rag(monkeypatch, tmp_path):
     fake_rag = ModuleType("app.ai.rag")
     fake_rag.ask_document = lambda _question, **_kwargs: ("", [])
+    fake_rag.document_sources = lambda _documents: []
+    fake_rag.documents_to_context = lambda _documents: ""
+    fake_rag.retrieve_documents = lambda _question, **_kwargs: []
     fake_rag.ingest_upload = lambda *_args, **_kwargs: (ProcessedDocument(documents=[]), 0)
     fake_rag.delete_document_from_index = lambda **_kwargs: 0
 
@@ -330,15 +372,40 @@ def _load_main_with_fake_rag(monkeypatch, tmp_path):
     monkeypatch.setenv("LLM_API_KEY", "test-api-key")
     monkeypatch.setenv("SMTP_ENABLED", "false")
     monkeypatch.setitem(sys.modules, "app.ai.rag", fake_rag)
-    sys.modules.pop("app.crud", None)
-    sys.modules.pop("app.database", None)
-    sys.modules.pop("app.ai.models", None)
-    sys.modules.pop("app.models", None)
-    sys.modules.pop("app.routers.ai", None)
-    sys.modules.pop("app.main", None)
+    for module_name in (
+        "app.crud",
+        "app.database",
+        "app.ai.models",
+        "app.models",
+        "app.routers.ai",
+        "app.routers.documents",
+        "app.services.document_ingestion",
+        "app.services.document_notifications",
+        "app.main",
+    ):
+        _drop_module(module_name)
 
     main_module = importlib.import_module("app.main")
+    database = importlib.import_module("app.database")
+    importlib.import_module("app.models")
+    database.Base.metadata.create_all(bind=database.engine)
     main_module.app.dependency_overrides[main_module.require_auth] = (
         lambda: SimpleNamespace(id=1, username="tester", role="admin")
     )
     return main_module
+
+
+def _documents_router():
+    return importlib.import_module("app.routers.documents")
+
+
+def _document_ingestion():
+    return importlib.import_module("app.services.document_ingestion")
+
+
+def _drop_module(module_name: str) -> None:
+    sys.modules.pop(module_name, None)
+    parent_name, _, attribute = module_name.rpartition(".")
+    parent = sys.modules.get(parent_name)
+    if parent is not None and hasattr(parent, attribute):
+        delattr(parent, attribute)

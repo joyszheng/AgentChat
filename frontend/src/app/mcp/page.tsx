@@ -33,11 +33,14 @@ import { isAdmin } from '@/lib/auth';
 import PageHeader from '@/components/PageHeader';
 
 
+type MCPTransport = 'streamable_http' | 'sse';
+
+
 interface MCPServer {
   id: number;
   name: string;
   description: string | null;
-  transport: 'streamable_http';
+  transport: MCPTransport;
   url: string;
   enabled: boolean;
   require_admin: boolean;
@@ -72,6 +75,7 @@ interface HeaderRow {
 interface ServerFormState {
   name: string;
   description: string;
+  transport: MCPTransport;
   url: string;
   enabled: boolean;
   requireAdmin: boolean;
@@ -86,6 +90,7 @@ interface ServerFormState {
 const EMPTY_FORM: ServerFormState = {
   name: '',
   description: '',
+  transport: 'streamable_http',
   url: '',
   enabled: false,
   requireAdmin: true,
@@ -196,6 +201,7 @@ export default function MCPPage() {
     setForm({
       name: server.name,
       description: server.description || '',
+      transport: server.transport,
       url: server.url,
       enabled: server.enabled,
       requireAdmin: server.require_admin,
@@ -293,6 +299,7 @@ export default function MCPPage() {
       if (editingServer) {
         const payload: Record<string, unknown> = {
           description: description || null,
+          transport: form.transport,
           url,
           enabled: form.enabled,
           require_admin: form.requireAdmin,
@@ -311,7 +318,7 @@ export default function MCPPage() {
         await http.post('/mcp/servers', {
           name,
           description: description || null,
-          transport: 'streamable_http',
+          transport: form.transport,
           url,
           headers,
           enabled: form.enabled,
@@ -512,7 +519,7 @@ export default function MCPPage() {
                       <div className="mt-4 rounded-lg bg-slate-50 p-3">
                         <div className="flex items-center gap-2 text-xs font-medium uppercase tracking-wide text-slate-500">
                           <WorkflowIcon size={14} />
-                          Streamable HTTP
+                          {server.transport === 'sse' ? 'SSE' : 'Streamable HTTP'}
                         </div>
                         <Tooltip title={server.url} placement="bottomLeft">
                           <p className="mt-1 truncate font-mono text-xs text-slate-700">{server.url}</p>
@@ -643,13 +650,19 @@ export default function MCPPage() {
               </label>
               <label className="space-y-1.5 text-sm font-medium text-slate-700" htmlFor="mcp-transport">
                 传输协议
-                <input
+                <select
                   id="mcp-transport"
-                  value="Streamable HTTP"
-                  readOnly
-                  className="min-h-11 w-full rounded-lg border border-slate-200 bg-slate-100 px-3 text-sm font-normal text-slate-600"
-                />
-                <span className="block text-xs font-normal text-slate-500">首期仅支持远程 Streamable HTTP。</span>
+                  value={form.transport}
+                  onChange={(event) => setForm((current) => ({
+                    ...current,
+                    transport: event.target.value as MCPTransport,
+                  }))}
+                  className="min-h-11 w-full rounded-lg border border-slate-300 bg-white px-3 text-sm font-normal text-slate-900 transition-colors focus:border-blue-500 focus:outline-none"
+                >
+                  <option value="streamable_http">Streamable HTTP（推荐）</option>
+                  <option value="sse">SSE（兼容旧服务）</option>
+                </select>
+                <span className="block text-xs font-normal text-slate-500">新服务优先使用 Streamable HTTP，旧服务可选择 SSE。</span>
               </label>
             </div>
             <label className="space-y-1.5 text-sm font-medium text-slate-700" htmlFor="mcp-url">

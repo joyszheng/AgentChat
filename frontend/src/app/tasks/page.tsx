@@ -3,27 +3,18 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Button,
-  DatePicker,
-  Drawer,
   Input,
-  Modal,
   Popconfirm,
   Select,
   message,
 } from 'antd';
-import zhCN from 'antd/es/date-picker/locale/zh_CN';
-import dayjs, { Dayjs } from 'dayjs';
-import 'dayjs/locale/zh-cn';
 import {
   BadgeAlertIcon,
-  BanIcon,
   BotIcon,
-  CircleCheckIcon,
   CircleDashedIcon,
   ClockIcon,
   DeleteIcon,
   HistoryIcon,
-  PlayIcon,
   PlusIcon,
   RefreshCwIcon,
   SearchIcon,
@@ -32,224 +23,33 @@ import {
 import http from '@/lib/http/axios';
 import PageHeader from '@/components/PageHeader';
 
-type TaskStatus = 'todo' | 'in_progress' | 'blocked' | 'done' | 'canceled';
-type TaskPriority = 'low' | 'normal' | 'high' | 'urgent';
-type TaskExecutionMode = 'manual' | 'ai_auto';
-type TaskRecurrenceRule = 'none' | 'daily';
-type AutoRefreshIntervalMs = 0 | 10000 | 30000 | 60000 | 300000 | 600000;
-
-interface TaskItem {
-  id: number;
-  title: string;
-  description?: string | null;
-  completed: boolean;
-  status: TaskStatus;
-  priority: TaskPriority;
-  due_at?: string | null;
-  source: 'manual' | 'ai';
-  execution_mode: TaskExecutionMode;
-  schedule_at?: string | null;
-  recurrence_rule: TaskRecurrenceRule;
-  ai_prompt?: string | null;
-  notify_email?: string | null;
-  last_run_at?: string | null;
-  next_run_at?: string | null;
-  run_status: string;
-  run_error?: string | null;
-  run_count: number;
-  created_at: string;
-  updated_at: string;
-}
-
-interface TaskRunItem {
-  id: number;
-  task_id: number;
-  status: string;
-  output?: string | null;
-  error_message?: string | null;
-  tools_used: string[];
-  email_sent: boolean;
-  started_at: string;
-  finished_at?: string | null;
-}
-
-interface TaskFormState {
-  title: string;
-  description: string;
-  status: TaskStatus;
-  priority: TaskPriority;
-  dueAt: string;
-  executionMode: TaskExecutionMode;
-  scheduleAt: string;
-  recurrenceRule: TaskRecurrenceRule;
-  aiPrompt: string;
-  notifyEmail: string;
-}
-
-type AnimatedIconComponent = React.ComponentType<{
-  size?: number;
-  className?: string;
-  animateOnHover?: boolean;
-}>;
-
-const statusOptions: { label: string; value: TaskStatus | 'all' }[] = [
-  { label: '全部状态', value: 'all' },
-  { label: '待处理', value: 'todo' },
-  { label: '进行中', value: 'in_progress' },
-  { label: '阻塞', value: 'blocked' },
-  { label: '已完成', value: 'done' },
-  { label: '已取消', value: 'canceled' },
-];
-
-const priorityOptions: { label: string; value: TaskPriority | 'all' }[] = [
-  { label: '全部优先级', value: 'all' },
-  { label: '低', value: 'low' },
-  { label: '普通', value: 'normal' },
-  { label: '高', value: 'high' },
-  { label: '紧急', value: 'urgent' },
-];
-
-const executionModeOptions: { label: string; value: TaskExecutionMode }[] = [
-  { label: '手动处理', value: 'manual' },
-  { label: 'AI 自动执行', value: 'ai_auto' },
-];
-
-const recurrenceOptions: { label: string; value: TaskRecurrenceRule }[] = [
-  { label: '只执行一次', value: 'none' },
-  { label: '每天重复', value: 'daily' },
-];
-
-const autoRefreshOptions: { label: string; shortLabel: string; value: AutoRefreshIntervalMs }[] = [
-  { label: '关闭自动刷新', shortLabel: '手动', value: 0 },
-  { label: '每 10 秒', shortLabel: '10 秒', value: 10000 },
-  { label: '每 30 秒', shortLabel: '30 秒', value: 30000 },
-  { label: '每 1 分钟', shortLabel: '1 分钟', value: 60000 },
-  { label: '每 5 分钟', shortLabel: '5 分钟', value: 300000 },
-  { label: '每 10 分钟', shortLabel: '10 分钟', value: 600000 },
-];
-
-const statusMeta: Record<TaskStatus, { label: string; color: string; Icon: AnimatedIconComponent }> = {
-  todo: { label: '待处理', color: 'default', Icon: CircleDashedIcon },
-  in_progress: { label: '进行中', color: 'processing', Icon: PlayIcon },
-  blocked: { label: '阻塞', color: 'warning', Icon: BadgeAlertIcon },
-  done: { label: '已完成', color: 'success', Icon: CircleCheckIcon },
-  canceled: { label: '已取消', color: 'error', Icon: BanIcon },
-};
-
-const priorityMeta: Record<TaskPriority, { label: string; color: string }> = {
-  low: { label: '低', color: 'blue' },
-  normal: { label: '普通', color: 'default' },
-  high: { label: '高', color: 'orange' },
-  urgent: { label: '紧急', color: 'red' },
-};
-
-const runStatusMeta: Record<string, string> = {
-  idle: '未启用',
-  pending: '等待执行',
-  queued: '已入队列',
-  running: '执行中',
-  success: '执行成功',
-  failed: '执行失败',
-};
-
-const runRecordMeta: Record<string, { label: string; className: string }> = {
-  running: { label: '执行中', className: 'border-blue-100 bg-blue-50 text-blue-700' },
-  success: { label: '执行成功', className: 'border-emerald-100 bg-emerald-50 text-emerald-700' },
-  failed: { label: '执行失败', className: 'border-red-100 bg-red-50 text-red-700' },
-};
-
-const taskTagBaseClassName =
-  'inline-flex h-6 shrink-0 items-center gap-1 rounded-md border px-2 text-xs font-medium leading-none whitespace-nowrap';
-
-const statusTagClassName: Record<TaskStatus, string> = {
-  todo: 'border-gray-200 bg-gray-50 text-gray-700',
-  in_progress: 'border-blue-100 bg-blue-50 text-blue-700',
-  blocked: 'border-amber-100 bg-amber-50 text-amber-700',
-  done: 'border-emerald-100 bg-emerald-50 text-emerald-700',
-  canceled: 'border-red-100 bg-red-50 text-red-700',
-};
-
-const priorityTagClassName: Record<TaskPriority, string> = {
-  low: 'border-sky-100 bg-sky-50 text-sky-700',
-  normal: 'border-gray-200 bg-gray-50 text-gray-700',
-  high: 'border-orange-100 bg-orange-50 text-orange-700',
-  urgent: 'border-red-100 bg-red-50 text-red-700',
-};
-
-const emptyForm: TaskFormState = {
-  title: '',
-  description: '',
-  status: 'todo',
-  priority: 'normal',
-  dueAt: '',
-  executionMode: 'manual',
-  scheduleAt: '',
-  recurrenceRule: 'none',
-  aiPrompt: '',
-  notifyEmail: '',
-};
-
-dayjs.locale('zh-cn');
-
-const roundToNextFiveMinutes = () => {
-  const now = dayjs().add(1, 'hour');
-  const minute = Math.ceil(now.minute() / 5) * 5;
-  return now.minute(minute).second(0).millisecond(0);
-};
-
-const toPayloadDateTime = (value: string) => {
-  return value || null;
-};
-
-const toPickerValue = (value: string) => {
-  if (!value) return null;
-  const date = dayjs(value);
-  return date.isValid() ? date : null;
-};
-
-const isPastDateTime = (value: string) => {
-  const date = toPickerValue(value);
-  return Boolean(date && date.isBefore(dayjs()));
-};
-
-const disabledPastDate = (current: Dayjs) => {
-  return current.endOf('day').isBefore(dayjs());
-};
-
-const disabledPastTime = (current: Dayjs | null) => {
-  if (!current || !current.isSame(dayjs(), 'day')) {
-    return {};
-  }
-
-  const now = dayjs();
-  return {
-    disabledHours: () => Array.from({ length: now.hour() }, (_, hour) => hour),
-    disabledMinutes: (selectedHour: number) => (
-      selectedHour === now.hour()
-        ? Array.from({ length: now.minute() + 1 }, (_, minute) => minute)
-        : []
-    ),
-  };
-};
-
-const formatDateTime = (value?: string | null) => {
-  if (!value) return '未设置';
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) return '未设置';
-  return new Intl.DateTimeFormat('zh-CN', {
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-  }).format(date);
-};
-
-const formatCountdownSeconds = (seconds: number) => {
-  const safeSeconds = Math.max(0, seconds);
-  const minutes = Math.floor(safeSeconds / 60);
-  const remainingSeconds = safeSeconds % 60;
-  return `${String(minutes).padStart(2, '0')}:${String(remainingSeconds).padStart(2, '0')}`;
-};
+import {
+  TaskStatus,
+  TaskPriority,
+  AutoRefreshIntervalMs,
+  TaskItem,
+  TaskRunItem,
+  TaskFormState,
+} from './types';
+import {
+  statusOptions,
+  priorityOptions,
+  autoRefreshOptions,
+  statusMeta,
+  priorityMeta,
+  runStatusMeta,
+  taskTagBaseClassName,
+  statusTagClassName,
+  priorityTagClassName,
+  emptyForm,
+} from './constants';
+import {
+  toPayloadDateTime,
+  formatDateTime,
+  formatCountdownSeconds,
+} from './utils';
+import TaskFormModal from './components/TaskFormModal';
+import TaskHistoryDrawer from './components/TaskHistoryDrawer';
 
 export default function TasksPage() {
   const [tasks, setTasks] = useState<TaskItem[]>([]);
@@ -272,15 +72,6 @@ export default function TasksPage() {
     [tasks],
   );
   const doneTasks = tasks.filter((task) => task.status === 'done').length;
-  const dueAtPresets = useMemo(
-    () => [
-      { label: '1 小时后', value: roundToNextFiveMinutes() },
-      { label: '明天 09:00', value: dayjs().add(1, 'day').hour(9).minute(0).second(0) },
-      { label: '三天后 18:00', value: dayjs().add(3, 'day').hour(18).minute(0).second(0) },
-      { label: '一周后 09:00', value: dayjs().add(1, 'week').hour(9).minute(0).second(0) },
-    ],
-    [modalOpen],
-  );
 
   const fetchTasks = useCallback(async () => {
     setLoading(true);
@@ -671,236 +462,22 @@ export default function TasksPage() {
         </div>
       </div>
 
-      <Modal
-        title={
-          <span className="text-base font-semibold text-gray-900">
-            {editingTask ? '编辑任务' : '新建任务'}
-          </span>
-        }
+      <TaskFormModal
         open={modalOpen}
+        editingTask={editingTask}
+        form={form}
+        setForm={setForm}
+        onSave={saveTask}
         onCancel={() => setModalOpen(false)}
-        onOk={saveTask}
-        confirmLoading={saving}
-        okText="保存"
-        cancelText="取消"
-        destroyOnHidden
-      >
-        <div className="space-y-3 pt-1">
-          <label className="block">
-            <span className="mb-1 block text-xs font-medium text-gray-600">标题</span>
-            <Input
-              value={form.title}
-              maxLength={100}
-              showCount
-              onChange={(event) => setForm((current) => ({ ...current, title: event.target.value }))}
-            />
-          </label>
+        saving={saving}
+      />
 
-          <label className="block">
-            <span className="mb-1 block text-xs font-medium text-gray-600">描述</span>
-            <Input.TextArea
-              value={form.description}
-              maxLength={500}
-              showCount
-              autoSize={{ minRows: 3, maxRows: 6 }}
-              onChange={(event) =>
-                setForm((current) => ({ ...current, description: event.target.value }))
-              }
-            />
-          </label>
-
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-            <label className="block">
-              <span className="mb-1 block text-xs font-medium text-gray-600">状态</span>
-              <Select<TaskStatus>
-                value={form.status}
-                options={statusOptions.filter((item) => item.value !== 'all') as { label: string; value: TaskStatus }[]}
-                onChange={(value) => setForm((current) => ({ ...current, status: value }))}
-                className="w-full"
-              />
-            </label>
-
-            <label className="block">
-              <span className="mb-1 block text-xs font-medium text-gray-600">优先级</span>
-              <Select<TaskPriority>
-                value={form.priority}
-                options={priorityOptions.filter((item) => item.value !== 'all') as { label: string; value: TaskPriority }[]}
-                onChange={(value) => setForm((current) => ({ ...current, priority: value }))}
-                className="w-full"
-              />
-            </label>
-
-            <label className="block">
-              <span className="mb-1 block text-xs font-medium text-gray-600">截止时间</span>
-              <DatePicker
-                allowClear
-                showNow
-                showTime={{ format: 'HH:mm', minuteStep: 5 }}
-                format="YYYY-MM-DD HH:mm"
-                locale={zhCN}
-                presets={dueAtPresets}
-                placeholder="选择日期和时间"
-                suffixIcon={<ClockIcon size={16} />}
-                value={toPickerValue(form.dueAt)}
-                onChange={(value) =>
-                  setForm((current) => ({
-                    ...current,
-                    dueAt: value ? value.toISOString() : '',
-                  }))
-                }
-                className="w-full"
-              />
-            </label>
-          </div>
-
-          <div className="border-t border-gray-100 pt-3">
-            <div className="mb-3 flex items-center gap-2 text-xs font-medium text-gray-600">
-              <BotIcon size={14} />
-              AI 执行
-            </div>
-            <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
-              <label className="block">
-                <span className="mb-1 block text-xs font-medium text-gray-600">执行方式</span>
-                <Select<TaskExecutionMode>
-                  value={form.executionMode}
-                  options={executionModeOptions}
-                  onChange={(value) =>
-                    setForm((current) => ({ ...current, executionMode: value }))
-                  }
-                  className="w-full"
-                />
-              </label>
-
-              <label className="block">
-                <span className="mb-1 block text-xs font-medium text-gray-600">执行时间</span>
-                <DatePicker
-                  allowClear
-                  disabled={form.executionMode !== 'ai_auto'}
-                  showNow
-                  showTime={{ format: 'HH:mm', minuteStep: 5 }}
-                  format="YYYY-MM-DD HH:mm"
-                  locale={zhCN}
-                  disabledDate={disabledPastDate}
-                  disabledTime={disabledPastTime}
-                  presets={dueAtPresets}
-                  placeholder="选择执行时间"
-                  suffixIcon={<ClockIcon size={16} />}
-                  value={toPickerValue(form.scheduleAt)}
-                  onChange={(value) =>
-                    setForm((current) => ({
-                      ...current,
-                      scheduleAt: value ? value.toISOString() : '',
-                    }))
-                  }
-                  className="w-full"
-                />
-              </label>
-
-              <label className="block">
-                <span className="mb-1 block text-xs font-medium text-gray-600">重复规则</span>
-                <Select<TaskRecurrenceRule>
-                  disabled={form.executionMode !== 'ai_auto'}
-                  value={form.recurrenceRule}
-                  options={recurrenceOptions}
-                  onChange={(value) =>
-                    setForm((current) => ({ ...current, recurrenceRule: value }))
-                  }
-                  className="w-full"
-                />
-              </label>
-            </div>
-
-            {form.executionMode === 'ai_auto' && (
-              <div className="mt-3 grid grid-cols-1 gap-3">
-                <label className="block">
-                  <span className="mb-1 block text-xs font-medium text-gray-600">
-                    AI 执行说明
-                  </span>
-                  <Input.TextArea
-                    value={form.aiPrompt}
-                    maxLength={4000}
-                    showCount
-                    autoSize={{ minRows: 3, maxRows: 6 }}
-                    placeholder="例如：总结今天未完成的任务，按优先级给出明天建议。"
-                    onChange={(event) =>
-                      setForm((current) => ({ ...current, aiPrompt: event.target.value }))
-                    }
-                  />
-                </label>
-
-                <label className="block">
-                  <span className="mb-1 block text-xs font-medium text-gray-600">
-                    结果收件邮箱
-                  </span>
-                  <Input
-                    value={form.notifyEmail}
-                    type="email"
-                    placeholder="可选；也可以直接写在 AI 执行说明里"
-                    onChange={(event) =>
-                      setForm((current) => ({ ...current, notifyEmail: event.target.value }))
-                    }
-                  />
-                </label>
-              </div>
-            )}
-          </div>
-        </div>
-      </Modal>
-
-      <Drawer
-        title={(
-          <span className="text-base font-semibold text-gray-900">
-            执行历史{historyTask ? ` · ${historyTask.title}` : ''}
-          </span>
-        )}
-        placement="right"
-        size={520}
+      <TaskHistoryDrawer
+        historyTask={historyTask}
         onClose={() => setHistoryTask(null)}
-        open={historyTask !== null}
-        destroyOnHidden
-      >
-        {runsLoading && <p className="text-sm text-gray-500">加载中…</p>}
-
-        {!runsLoading && runs.length === 0 && (
-          <div className="rounded-lg border border-dashed border-gray-200 bg-gray-50 px-6 py-12 text-center text-sm text-gray-500">
-            暂无执行记录
-          </div>
-        )}
-
-        <div className="flex flex-col gap-3">
-          {runs.map((run) => {
-            const meta = runRecordMeta[run.status] || {
-              label: run.status,
-              className: 'border-gray-200 bg-gray-50 text-gray-700',
-            };
-            return (
-              <div key={run.id} className="rounded-lg border border-gray-200 bg-white p-3">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className={`${taskTagBaseClassName} ${meta.className}`}>{meta.label}</span>
-                  <span className="text-xs text-gray-500">{formatDateTime(run.started_at)}</span>
-                  {run.email_sent && (
-                    <span className={`${taskTagBaseClassName} border-emerald-100 bg-emerald-50 text-emerald-700`}>
-                      已发邮件
-                    </span>
-                  )}
-                </div>
-
-                {run.error_message && (
-                  <p className="mt-2 whitespace-pre-wrap break-words rounded-md border border-red-100 bg-red-50/70 px-3 py-2 text-xs leading-5 text-red-700">
-                    {run.error_message}
-                  </p>
-                )}
-
-                {run.output && (
-                  <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-words rounded-md border border-gray-100 bg-gray-50 px-3 py-2 text-xs leading-5 text-gray-700">
-                    {run.output}
-                  </pre>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      </Drawer>
+        runs={runs}
+        runsLoading={runsLoading}
+      />
     </div>
   );
 }

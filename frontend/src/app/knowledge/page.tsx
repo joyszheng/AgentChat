@@ -11,8 +11,46 @@ import type { UploadProps } from 'antd';
 
 const { Dragger } = Upload;
 
-const DocumentStatusCell = ({ doc, onComplete }: { doc: any; onComplete: () => void }) => {
-  const [statusInfo, setStatusInfo] = useState(doc);
+interface UploadPolicy {
+  max_bytes: number;
+  allowed_extensions: string[];
+  type_limits: Record<string, number>;
+  chunk_read_bytes: number;
+  document_max_text_chars: number;
+  document_max_chunks: number;
+}
+
+export interface DocumentItem {
+  id: number;
+  original_filename: string;
+  size_bytes: number;
+  status: 'uploaded' | 'processing' | 'indexed' | 'failed' | string;
+  progress?: number;
+  message?: string;
+  error_message?: string;
+  created_at: string;
+  updated_at?: string;
+}
+
+const formatBytes = (size: number) => {
+  if (!Number.isFinite(size) || size <= 0) return '-';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = size;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return unitIndex === 0 ? `${value} ${units[unitIndex]}` : `${value.toFixed(1)} ${units[unitIndex]}`;
+};
+
+const getFileExtension = (filename: string) => {
+  const dotIndex = filename.lastIndexOf('.');
+  return dotIndex >= 0 ? filename.slice(dotIndex).toLowerCase() : '';
+};
+
+const DocumentStatusCell = ({ doc, onComplete }: { doc: DocumentItem; onComplete: () => void }) => {
+  const [statusInfo, setStatusInfo] = useState<DocumentItem>(doc);
 
   // 同步外部传入的最新 doc 状态
   useEffect(() => {
@@ -29,7 +67,7 @@ const DocumentStatusCell = ({ doc, onComplete }: { doc: any; onComplete: () => v
     const handleProgress = (event: MessageEvent) => {
       try {
         const data = JSON.parse(event.data);
-        setStatusInfo((prev: any) => ({ ...prev, ...data }));
+        setStatusInfo((prev: DocumentItem) => ({ ...prev, ...data }));
       } catch (err) {
         console.error('Event parsing error:', err);
       }
@@ -38,7 +76,7 @@ const DocumentStatusCell = ({ doc, onComplete }: { doc: any; onComplete: () => v
     const handleComplete = (event: MessageEvent) => {
       try {
         const data = JSON.parse(event.data);
-        setStatusInfo((prev: any) => ({ ...prev, ...data }));
+        setStatusInfo((prev: DocumentItem) => ({ ...prev, ...data }));
         eventSource.close();
         onComplete();
       } catch (err) {
@@ -49,7 +87,7 @@ const DocumentStatusCell = ({ doc, onComplete }: { doc: any; onComplete: () => v
     const handleFailed = (event: MessageEvent) => {
       try {
         const data = JSON.parse(event.data);
-        setStatusInfo((prev: any) => ({ ...prev, ...data }));
+        setStatusInfo((prev: DocumentItem) => ({ ...prev, ...data }));
         eventSource.close();
         onComplete();
       } catch (err) {
@@ -98,10 +136,11 @@ const DocumentStatusCell = ({ doc, onComplete }: { doc: any; onComplete: () => v
 };
 
 export default function KnowledgePage() {
-  const [documents, setDocuments] = useState<any[]>([]);
+  const [documents, setDocuments] = useState<DocumentItem[]>([]);
   const [isMobile, setIsMobile] = useState(false);
   const [downloadingDocs, setDownloadingDocs] = useState<Record<number, number>>({});
   const [isLoggedIn, setIsLoggedIn] = useState(false);
+  const [uploadPolicy, setUploadPolicy] = useState<UploadPolicy | null>(null);
 
   useEffect(() => {
     const handleResize = () => setIsMobile(window.innerWidth < 768);
@@ -115,12 +154,18 @@ export default function KnowledgePage() {
   }, []);
 
   const { run: fetchDocuments, loading } = useRequest(async () => {
-    const res: any = await http.get('/documents');
+    const res: DocumentItem[] = await http.get('/documents');
     setDocuments(res);
+  });
+
+  const { run: fetchUploadPolicy } = useRequest(async () => {
+    const res: UploadPolicy = await http.get('/documents/upload-policy');
+    setUploadPolicy(res);
   });
 
   useEffect(() => {
     fetchDocuments();
+    fetchUploadPolicy();
   }, []);
 
   const deleteDocument = async (id: number) => {
@@ -133,11 +178,11 @@ export default function KnowledgePage() {
     }
   };
 
-  const handleDownload = async (doc: any) => {
+  const handleDownload = async (doc: DocumentItem) => {
     try {
       setDownloadingDocs(prev => ({ ...prev, [doc.id]: 0 }));
       
-      const data: any = await http.get(`/documents/${doc.id}/download`, {
+      const data: Blob = await http.get(`/documents/${doc.id}/download`, {
         responseType: 'blob',
         onDownloadProgress: (progressEvent) => {
           if (progressEvent.total) {
@@ -175,12 +220,28 @@ export default function KnowledgePage() {
     multiple: true,
     accept: '.pdf,.docx,.md,.txt',
     action: `${process.env.NEXT_PUBLIC_API_URL || 'http://127.0.0.1:8000'}/upload`,
+    headers: (() => {
+      const token = typeof window !== 'undefined' ? localStorage.getItem('access_token') : null;
+      return token ? { Authorization: `Bearer ${token}` } : undefined;
+    })(),
     beforeUpload: (file) => {
-      const isSupported = ['.pdf', '.docx', '.md', '.txt'].some(ext => file.name.toLowerCase().endsWith(ext));
+      const extension = getFileExtension(file.name);
+      const allowedExtensions = uploadPolicy?.allowed_extensions || ['.pdf', '.docx', '.md', '.txt'];
+      const isSupported = allowedExtensions.includes(extension);
       if (!isSupported) {
         message.error(`${file.name} 格式不支持，仅支持 PDF, DOCX, MD, TXT`);
       }
-      return isSupported || Upload.LIST_IGNORE;
+      if (!isSupported) {
+        return Upload.LIST_IGNORE;
+      }
+
+      const maxBytes = uploadPolicy?.type_limits?.[extension];
+      if (maxBytes && file.size > maxBytes) {
+        message.error(`${file.name} exceeds the ${formatBytes(maxBytes)} upload limit`);
+        return Upload.LIST_IGNORE;
+      }
+
+      return true;
     },
     onChange(info) {
       if (info.file.status === 'done') {
@@ -207,7 +268,7 @@ export default function KnowledgePage() {
     {
       title: '状态',
       key: 'status',
-      render: (_: any, record: any) => <DocumentStatusCell doc={record} onComplete={fetchDocuments} />,
+      render: (_: unknown, record: DocumentItem) => <DocumentStatusCell doc={record} onComplete={fetchDocuments} />,
     },
     {
       title: '上传时间',
@@ -218,7 +279,7 @@ export default function KnowledgePage() {
     {
       title: '操作',
       key: 'action',
-      render: (_: any, record: any) => (
+      render: (_: unknown, record: DocumentItem) => (
         <div className="flex gap-2 items-center">
           {downloadingDocs[record.id] !== undefined ? (
             <Progress type="circle" percent={downloadingDocs[record.id]} size={20} showInfo={false} />
@@ -251,7 +312,7 @@ export default function KnowledgePage() {
     }
   ];
 
-  const renderMobileCard = (doc: any) => (
+  const renderMobileCard = (doc: DocumentItem) => (
     <div key={doc.id} className="bg-white p-4 rounded-xl border border-gray-100 shadow-sm flex flex-col gap-3">
       <div className="flex justify-between items-start">
         <div className="font-medium text-gray-800 break-all pr-2 text-sm">{doc.original_filename}</div>

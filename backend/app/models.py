@@ -217,11 +217,22 @@ class MCPServer(Base):
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
     name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
+    namespace: Mapped[str | None] = mapped_column(
+        String(48), nullable=True, unique=True, index=True
+    )
     description: Mapped[str | None] = mapped_column(String(500), nullable=True)
     transport: Mapped[str] = mapped_column(
         String(30), default="streamable_http", nullable=False
     )
     url: Mapped[str] = mapped_column(String(1000), nullable=False)
+    transport_config: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    auth_profile_id: Mapped[int | None] = mapped_column(
+        ForeignKey("mcp_auth_profiles.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    config_revision: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    active_revision: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     headers_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
     require_admin: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
@@ -236,11 +247,116 @@ class MCPServer(Base):
     last_checked_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    protocol_version: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    server_info: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    capabilities: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    catalog_status: Mapped[str] = mapped_column(
+        String(30), default="unknown", nullable=False, index=True
+    )
+    catalog_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
     )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class MCPAuthProfile(Base):
+    """Authentication material referenced by one or more MCP connections."""
+
+    __tablename__ = "mcp_auth_profiles"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
+    auth_type: Mapped[str] = mapped_column(String(30), default="none", nullable=False, index=True)
+    config: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    secret_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class MCPToolPolicy(Base):
+    """Local authorization and execution policy for one discovered MCP tool."""
+
+    __tablename__ = "mcp_tool_policies"
+    __table_args__ = (
+        UniqueConstraint("server_id", "source_name", name="uq_mcp_tool_policy_server_name"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    server_id: Mapped[int] = mapped_column(
+        ForeignKey("mcp_servers.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    source_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    required_role: Mapped[str] = mapped_column(String(30), default="admin", nullable=False)
+    risk_level: Mapped[str] = mapped_column(String(20), default="medium", nullable=False)
+    approval_mode: Mapped[str] = mapped_column(String(30), default="auto", nullable=False)
+    timeout_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    max_result_chars: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    schema_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class MCPCallLog(Base):
+    """Redacted audit record for one MCP tool invocation."""
+
+    __tablename__ = "mcp_call_logs"
+
+    id: Mapped[int] = mapped_column(primary_key=True, index=True)
+    call_id: Mapped[str] = mapped_column(String(36), nullable=False, unique=True, index=True)
+    server_id: Mapped[int | None] = mapped_column(
+        ForeignKey("mcp_servers.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    source_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    qualified_name: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    user_id: Mapped[int | None] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    conversation_id: Mapped[int | None] = mapped_column(
+        ForeignKey("chat_sessions.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    invocation_source: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    arguments_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False, index=True
+    )
+
+
+class MCPConfigState(Base):
+    """Monotonic revision used to synchronize MCP registries across processes."""
+
+    __tablename__ = "mcp_config_state"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    revision: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

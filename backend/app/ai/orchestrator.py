@@ -92,7 +92,6 @@ async def stream_unified_assistant(
     pending_has_tool_call = False
     streamed_parts: list[str] = []
     tool_activity_seen = False
-    mcp_activity_seen = False
     progress_tools_announced: set[str] = set()
     mcp_tool_names = {tool.name for tool in mcp_tools}
 
@@ -108,11 +107,7 @@ async def stream_unified_assistant(
                 pending_parts = []
             text = _chunk_text(message)
             if text:
-                if tool_activity_seen and not pending_has_tool_call and not mcp_activity_seen:
-                    streamed_parts.append(text)
-                    yield AssistantStreamEvent(delta=text)
-                else:
-                    pending_parts.append(text)
+                pending_parts.append(text)
         elif part_type == "values":
             if isinstance(data, dict):
                 final_state = data
@@ -121,8 +116,6 @@ async def stream_unified_assistant(
                 new_tools = [tool for tool in current_tools if tool not in progress_tools_announced]
                 if new_tools:
                     tool_activity_seen = True
-                    if any(tool in mcp_tool_names for tool in new_tools):
-                        mcp_activity_seen = True
                     progress_tools_announced.update(new_tools)
                     yield AssistantStreamEvent(
                         progress=_tool_progress_message(new_tools, mcp_tool_names),
@@ -148,20 +141,23 @@ async def stream_unified_assistant(
                 pending_parts = []
                 pending_has_tool_call = False
 
-    if pending_parts and not pending_has_tool_call and not mcp_activity_seen:
+    if pending_parts and not pending_has_tool_call and not tool_activity_seen:
         for text in pending_parts:
             streamed_parts.append(text)
             yield AssistantStreamEvent(delta=text)
 
     messages = final_state.get("messages", []) if final_state else []
-    tools_used = _tools_used(messages)
+    tools_used = _merge_tool_names(
+        _tools_used(messages),
+        list(progress_tools_announced),
+    )
     answer = _last_assistant_text(messages) or "".join(streamed_parts)
-    if any(tool in mcp_tool_names for tool in tools_used):
-        answer = _sanitize_mcp_answer(answer)
+    if tools_used:
+        answer = _sanitize_tool_answer(answer, tools_used)
     if not answer:
         raise ValueError("Unified assistant returned an empty response")
 
-    if mcp_activity_seen:
+    if tool_activity_seen:
         for text in _split_text_for_stream(answer):
             yield AssistantStreamEvent(delta=text)
 
@@ -214,6 +210,8 @@ async def run_unified_assistant(
         raise ValueError("Unified assistant returned an empty response")
 
     tools_used = _tools_used(messages)
+    if tools_used:
+        answer = _sanitize_tool_answer(answer, tools_used)
     return AssistantResult(
         answer=answer,
         route=_infer_route(tools_used, {tool.name for tool in mcp_tools}),
@@ -294,14 +292,20 @@ def _split_text_for_stream(text: str, chunk_size: int = 16) -> list[str]:
 
 
 def _sanitize_mcp_answer(answer: str) -> str:
-    """Remove likely raw MCP payload/code leaks while preserving the natural answer."""
+    """Backward-compatible wrapper for MCP-only callers."""
+
+    return _sanitize_tool_answer(answer)
+
+
+def _sanitize_tool_answer(answer: str, tool_names: list[str] | None = None) -> str:
+    """Remove likely raw tool payload/code leaks while preserving the natural answer."""
 
     text = _strip_fenced_blocks(answer)
     text = _strip_json_payloads(text)
     lines = [
         line
         for line in text.splitlines()
-        if not _looks_like_raw_tool_line(line)
+        if not _looks_like_raw_tool_line(line, tool_names=tool_names)
     ]
     sanitized = "\n".join(lines).strip()
     if not sanitized and answer.strip():
@@ -362,17 +366,23 @@ def _looks_like_tool_payload(value: Any, raw: str) -> bool:
             "status",
             "payload",
             "content",
+            "context",
             "code",
             "source",
+            "sources",
         }
         return bool(tool_keys & set(value.keys()))
     return isinstance(value, list) and len(value) > 2
 
 
-def _looks_like_raw_tool_line(line: str) -> bool:
+def _looks_like_raw_tool_line(line: str, *, tool_names: list[str] | None = None) -> bool:
     stripped = line.strip()
     if not stripped:
         return False
+    if tool_names and stripped in set(tool_names):
+        return True
+    if stripped in {"调用完成", "工具调用完成", "调用工具完成"}:
+        return True
     raw_markers = (
         "tool_call",
         "tool_calls",
@@ -382,6 +392,15 @@ def _looks_like_raw_tool_line(line: str) -> bool:
         "DeprecationWarning",
     )
     return any(marker in stripped for marker in raw_markers)
+
+
+def _merge_tool_names(*groups: list[str]) -> list[str]:
+    names: list[str] = []
+    for group in groups:
+        for name in group:
+            if name not in names:
+                names.append(name)
+    return names
 
 
 def _last_assistant_text(messages: list) -> str:

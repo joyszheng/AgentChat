@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import AnyHttpUrl, BaseModel, Field, field_validator, model_validator
 
@@ -268,18 +268,63 @@ class ModelOptionsResponse(BaseModel):
     count: int
 
 
+class MCPStreamableHTTPConfig(BaseModel):
+    """Non-secret connection settings for a Streamable HTTP MCP server."""
+
+    transport: Literal["streamable_http"] = "streamable_http"
+    url: AnyHttpUrl
+    connect_timeout_seconds: int = Field(default=10, ge=1, le=120)
+    request_timeout_seconds: int = Field(default=20, ge=1, le=300)
+    tls_verify: bool = True
+    network_policy: Literal[
+        "public_https", "private_allowlist", "localhost_dev"
+    ] = "private_allowlist"
+
+
+class MCPSSEConfig(BaseModel):
+    """Non-secret connection settings for a legacy SSE MCP server."""
+
+    transport: Literal["sse"] = "sse"
+    url: AnyHttpUrl
+    connect_timeout_seconds: int = Field(default=10, ge=1, le=120)
+    request_timeout_seconds: int = Field(default=20, ge=1, le=300)
+    sse_read_timeout_seconds: int = Field(default=300, ge=1, le=3600)
+    tls_verify: bool = True
+    network_policy: Literal[
+        "public_https", "private_allowlist", "localhost_dev"
+    ] = "private_allowlist"
+
+
+MCPTransportConfig = Annotated[
+    MCPStreamableHTTPConfig | MCPSSEConfig,
+    Field(discriminator="transport"),
+]
+
+
 class MCPServerBase(BaseModel):
     """Common configuration for a remote MCP server."""
 
     name: str = Field(min_length=1, max_length=100, pattern=r"^[a-zA-Z0-9_-]+$")
     description: str | None = Field(default=None, max_length=500)
-    transport: Literal["streamable_http"] = "streamable_http"
-    url: AnyHttpUrl
+    transport: Literal["streamable_http", "sse"] = "streamable_http"
+    url: AnyHttpUrl | None = None
+    transport_config: MCPTransportConfig | None = None
     enabled: bool = False
     require_admin: bool = True
     allowed_tools: list[str] = Field(default_factory=list)
     call_timeout_seconds: int = Field(default=20, ge=1, le=300)
     max_result_chars: int = Field(default=20000, ge=1000, le=200000)
+
+    @model_validator(mode="after")
+    def normalize_connection(self):
+        if self.transport_config is None and self.url is None:
+            raise ValueError("必须提供 MCP URL 或 transport_config")
+        if self.transport_config is not None:
+            if self.url is not None and str(self.url) != str(self.transport_config.url):
+                raise ValueError("url 与 transport_config.url 不一致")
+            self.url = self.transport_config.url
+            self.transport = self.transport_config.transport
+        return self
 
     @field_validator("allowed_tools")
     @classmethod
@@ -302,13 +347,31 @@ class MCPServerUpdate(BaseModel):
     """Partially update an MCP server. Omitted headers preserve current credentials."""
 
     description: str | None = Field(default=None, max_length=500)
+    transport: Literal["streamable_http", "sse"] | None = None
     url: AnyHttpUrl | None = None
+    transport_config: MCPTransportConfig | None = None
     headers: dict[str, str] | None = None
     enabled: bool | None = None
     require_admin: bool | None = None
     allowed_tools: list[str] | None = None
     call_timeout_seconds: int | None = Field(default=None, ge=1, le=300)
     max_result_chars: int | None = Field(default=None, ge=1000, le=200000)
+
+    @model_validator(mode="after")
+    def validate_connection(self):
+        if (
+            self.url is not None
+            and self.transport_config is not None
+            and str(self.url) != str(self.transport_config.url)
+        ):
+            raise ValueError("url 与 transport_config.url 不一致")
+        if (
+            self.transport is not None
+            and self.transport_config is not None
+            and self.transport != self.transport_config.transport
+        ):
+            raise ValueError("transport 与 transport_config.transport 不一致")
+        return self
 
     @field_validator("allowed_tools")
     @classmethod
@@ -328,9 +391,14 @@ class MCPServerResponse(BaseModel):
 
     id: int
     name: str
+    namespace: str
     description: str | None
     transport: str
     url: str
+    transport_config: dict[str, Any]
+    auth_profile_id: int | None
+    config_revision: int
+    active_revision: int
     enabled: bool
     require_admin: bool
     allowed_tools: list[str]
@@ -341,6 +409,11 @@ class MCPServerResponse(BaseModel):
     last_health_status: str
     last_error: str | None
     last_checked_at: datetime | None
+    protocol_version: str | None
+    server_info: dict[str, Any]
+    capabilities: dict[str, Any]
+    catalog_status: str
+    catalog_updated_at: datetime | None
     created_at: datetime
     updated_at: datetime
 

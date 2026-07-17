@@ -287,11 +287,34 @@ def _load_main_with_fake_rag(monkeypatch, tmp_path):
     monkeypatch.setenv("DATABASE_URL", database_url)
     monkeypatch.setenv("LLM_API_KEY", "test-api-key")
     monkeypatch.setitem(sys.modules, "app.ai.rag", fake_rag)
-    sys.modules.pop("app.crud", None)
-    sys.modules.pop("app.database", None)
-    sys.modules.pop("app.ai.models", None)
-    sys.modules.pop("app.models", None)
-    sys.modules.pop("app.routers.ai", None)
-    sys.modules.pop("app.main", None)
+    for module_name in (
+        "app.crud",
+        "app.database",
+        "app.ai.models",
+        "app.models",
+        "app.repositories.chat",
+        "app.repositories.documents",
+        "app.repositories.settings",
+        "app.repositories.tasks",
+        "app.repositories.users",
+        "app.routers.ai",
+        "app.routers.documents",
+        "app.services.document_ingestion",
+        "app.services.document_notifications",
+        "app.main",
+    ):
+        _drop_module(module_name)
 
-    return importlib.import_module("app.main")
+    main_module = importlib.import_module("app.main")
+    database = importlib.import_module("app.database")
+    importlib.import_module("app.models")
+    database.Base.metadata.create_all(bind=database.engine)
+    return main_module
+
+
+def _drop_module(module_name: str) -> None:
+    sys.modules.pop(module_name, None)
+    parent_name, _, attribute = module_name.rpartition(".")
+    parent = sys.modules.get(parent_name)
+    if parent is not None and hasattr(parent, attribute):
+        delattr(parent, attribute)

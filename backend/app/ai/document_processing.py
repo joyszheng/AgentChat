@@ -13,6 +13,8 @@ from typing import Any
 
 from langchain_core.documents import Document
 
+from ..services.upload_policy import get_document_max_text_chars
+
 
 SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".md", ".txt"}
 logger = logging.getLogger("uvicorn.error")
@@ -117,23 +119,41 @@ def load_upload_documents(
     )
 
     if suffix == ".pdf":
-        return _load_pdf_documents(
+        processed = _load_pdf_documents(
+            path,
+            original_filename=original_filename,
+            content_type=content_type,
+        )
+    elif suffix == ".docx":
+        processed = _load_docx_documents(
+            path,
+            original_filename=original_filename,
+            content_type=content_type,
+        )
+    else:
+        processed = _load_text_document(
             path,
             original_filename=original_filename,
             content_type=content_type,
         )
 
-    if suffix == ".docx":
-        return _load_docx_documents(
-            path,
-            original_filename=original_filename,
-            content_type=content_type,
-        )
+    _validate_processed_text_size(processed, display_name=original_filename or path.name)
+    return processed
 
-    return _load_text_document(
-        path,
-        original_filename=original_filename,
-        content_type=content_type,
+
+def _validate_processed_text_size(processed: ProcessedDocument, *, display_name: str) -> None:
+    max_text_chars = get_document_max_text_chars()
+    total_characters = sum(len(document.page_content) for document in processed.documents)
+    if total_characters > max_text_chars:
+        raise DocumentProcessingError(
+            f"Document content is too large after parsing: {total_characters} characters "
+            f"exceeds the limit of {max_text_chars}. Please split the file and upload again."
+        )
+    logger.info(
+        "[document] Parsed text size accepted file=%r characters=%s max_characters=%s",
+        display_name,
+        total_characters,
+        max_text_chars,
     )
 
 

@@ -3,118 +3,15 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Bubble, Sender, Conversations } from '@ant-design/x';
 import { message, Collapse, Tooltip, Popconfirm, Drawer, Select, Tag } from 'antd';
-import { PlusIcon, PanelLeftOpenIcon, PanelLeftCloseIcon, DeleteIcon } from 'lucide-animated';
+import { PlusIcon, PanelLeftOpenIcon, PanelLeftCloseIcon } from 'lucide-animated';
 import http from '@/lib/http/axios';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 
-type ChatMode = 'auto' | 'chat' | 'rag' | 'mcp';
-type ToolCallStatus = 'running' | 'completed' | 'failed';
-
-interface ToolCallState {
-  name: string;
-  status: ToolCallStatus;
-}
-
-interface ChatMessageItem {
-  id: string;
-  role: string;
-  content: string;
-  sources?: string[];
-  toolsUsed?: string[];
-  toolCalls?: ToolCallState[];
-  mode?: ChatMode;
-  route?: string;
-  loading?: boolean;
-  streamStatus?: string;
-}
-
-interface ChatSessionItem {
-  id: number;
-  title?: string | null;
-  updated_at?: string | null;
-}
-
-interface ApiChatMessage {
-  id: number;
-  role: string;
-  content: string;
-  message_metadata?: {
-    model?: string;
-    route?: string;
-    sources?: string[];
-    tools_used?: string[];
-  };
-}
-
-interface MCPAssistantResponse {
-  answer: string;
-  session_id: number;
-  tools_used?: string[];
-}
-
-const CHAT_MODE_OPTIONS: { label: string; value: ChatMode }[] = [
-  { label: '智能助手', value: 'auto' },
-  { label: '大模型问答', value: 'chat' },
-  { label: '知识库', value: 'rag' },
-  { label: 'MCP 工具', value: 'mcp' },
-];
-
-const MODE_PLACEHOLDER: Record<ChatMode, string> = {
-  auto: '直接提问，智能选择知识库或工具...',
-  chat: '请输入问题...',
-  rag: '向知识库提问...',
-  mcp: '问我需要调用 MCP 工具的问题...',
-};
-
-const getErrorDetail = (error: unknown, fallback: string) => {
-  if (typeof error === 'object' && error !== null && 'response' in error) {
-    const response = (error as { response?: { data?: { detail?: string } } }).response;
-    return response?.data?.detail || fallback;
-  }
-  return error instanceof Error ? error.message : fallback;
-};
-
-const getStreamHeaders = () => {
-  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-  const token = typeof window !== 'undefined' ? localStorage.getItem('access_token') : null;
-  if (token) {
-    headers.Authorization = `Bearer ${token}`;
-  }
-  return headers;
-};
-
-const mergeToolCalls = (
-  current: ToolCallState[] | undefined,
-  toolNames: string[],
-  status: ToolCallStatus,
-) => {
-  const byName = new Map((current || []).map((item) => [item.name, item]));
-  for (const name of toolNames) {
-    byName.set(name, { name, status });
-  }
-  return Array.from(byName.values());
-};
-
-const getGroupName = (timeStr: string | null | undefined) => {
-  if (!timeStr) return '早期会话';
-  const date = new Date(timeStr);
-  const now = new Date();
-
-  const dateStr = date.toDateString();
-  const nowStr = now.toDateString();
-  if (dateStr === nowStr) return '今天';
-
-  const yesterday = new Date(now);
-  yesterday.setDate(now.getDate() - 1);
-  if (dateStr === yesterday.toDateString()) return '昨天';
-
-  const diffTime = Math.abs(now.getTime() - date.getTime());
-  const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
-  if (diffDays <= 7) return '一周内';
-
-  return `${date.getFullYear()}-${(date.getMonth() + 1).toString().padStart(2, '0')}`;
-};
+import { ChatMode, ToolCallState, ChatMessageItem, ChatSessionItem, ApiChatMessage, MCPAssistantResponse } from './types';
+import { CHAT_MODE_OPTIONS, MODE_PLACEHOLDER } from './constants';
+import { getErrorDetail, getStreamHeaders, mergeToolCalls, getGroupName } from './utils';
+import ChatSidebar from './components/ChatSidebar';
 
 export default function ChatPage() {
   const [messages, setMessages] = useState<ChatMessageItem[]>([{ id: 'welcome', role: 'assistant', content: '你好，我是 AgentChat，请问有什么可以帮你？' }]);
@@ -615,59 +512,7 @@ export default function ChatPage() {
     );
   };
 
-  const renderSidebar = () => (
-    <>
-      <div className="px-4 border-b border-gray-100 flex items-center justify-between bg-white hidden md:flex shrink-0 h-[56px]">
-        <span className="font-medium text-gray-700">历史会话</span>
-        <div className="flex items-center gap-1 -mr-2">
-          <Tooltip title="新会话">
-            <div className="flex items-center justify-center w-8 h-8 rounded-md hover:bg-black/5 cursor-pointer text-gray-600 transition-colors" onClick={startNewSession}>
-              <PlusIcon size={16} />
-            </div>
-          </Tooltip>
-          <Tooltip title="收起">
-            <div className="flex items-center justify-center w-8 h-8 rounded-md hover:bg-black/5 cursor-pointer text-gray-600 transition-colors" onClick={() => setSidebarCollapsed(true)}>
-              <PanelLeftCloseIcon size={16} />
-            </div>
-          </Tooltip>
-        </div>
-      </div>
-      <div className="flex-1 overflow-y-auto overflow-x-hidden bg-white md:bg-gray-50/30" onScroll={handleScroll}>
-        <Conversations
-          groupable={{
-            label: (group) => <span className="text-[11px] text-gray-400/90 font-medium tracking-wide">{group}</span>
-          }}
-          items={sessions.map(s => ({
-            key: s.id.toString(),
-            group: getGroupName(s.updated_at),
-            label: (
-              <div className="flex justify-between items-center w-full group overflow-hidden">
-                <span className="truncate flex-1">{s.title || '新会话'}</span>
-                <Popconfirm 
-                  title="确认删除该会话？"
-                  onConfirm={(e) => { e?.stopPropagation(); deleteSession(s.id); }}
-                  onCancel={(e) => e?.stopPropagation()}
-                  okText="确认"
-                  cancelText="取消"
-                >
-                  <div 
-                    className="flex items-center justify-center w-6 h-6 rounded-md hover:bg-red-50 cursor-pointer opacity-100 md:opacity-0 group-hover:opacity-100 transition-all text-gray-400 hover:text-red-500 ml-2"
-                    onClick={(e) => e.stopPropagation()}
-                  >
-                    <DeleteIcon size={14} />
-                  </div>
-                </Popconfirm>
-              </div>
-            ),
-          }))}
-          activeKey={sessionId ? sessionId.toString() : undefined}
-          onActiveChange={(key) => loadSession(Number(key))}
-        />
-        {loadingMore && <div className="text-center py-3 text-xs text-gray-400">加载中...</div>}
-        {!hasMore && sessions.length > 0 && <div className="text-center py-3 text-xs text-gray-300">没有更多会话了</div>}
-      </div>
-    </>
-  );
+
 
   return (
     <div className="flex h-full bg-white overflow-hidden relative">
@@ -681,14 +526,34 @@ export default function ChatPage() {
           styles={{ body: { padding: 0, display: 'flex', flexDirection: 'column' } }}
           size="default"
         >
-          {renderSidebar()}
+          <ChatSidebar
+            sessions={sessions}
+            sessionId={sessionId}
+            loadingMore={loadingMore}
+            hasMore={hasMore}
+            onScroll={handleScroll}
+            onLoadSession={loadSession}
+            onDeleteSession={deleteSession}
+            onStartNewSession={startNewSession}
+            onCollapse={() => setSidebarCollapsed(true)}
+          />
         </Drawer>
       )}
 
       {/* Desktop Sidebar */}
       {!isMobile && !sidebarCollapsed && (
         <div className="hidden md:flex w-64 border-r border-gray-100 flex-col bg-gray-50/50">
-          {renderSidebar()}
+          <ChatSidebar
+            sessions={sessions}
+            sessionId={sessionId}
+            loadingMore={loadingMore}
+            hasMore={hasMore}
+            onScroll={handleScroll}
+            onLoadSession={loadSession}
+            onDeleteSession={deleteSession}
+            onStartNewSession={startNewSession}
+            onCollapse={() => setSidebarCollapsed(true)}
+          />
         </div>
       )}
 

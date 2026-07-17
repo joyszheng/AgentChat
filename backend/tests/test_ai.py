@@ -29,7 +29,13 @@ def _auth_headers(username: str = "ai-task-user"):
     return {"Authorization": f"Bearer {token}"}
 
 
-def test_ai_chat():
+def test_ai_chat(monkeypatch):
+    fake_chain = SimpleNamespace(
+        invoke=lambda _input: SimpleNamespace(content="FastAPI 是现代 Python Web 框架。")
+    )
+    monkeypatch.setattr(ai_router, "get_llm_from_config", lambda _db: object())
+    monkeypatch.setattr(ai_router, "create_chat_chain", lambda _llm: fake_chain)
+
     response = client.post(
         "/ai/chat",
         json={"message": "[TEST] 请用一句话介绍 FastAPI"},
@@ -66,7 +72,15 @@ def test_tasks_assistant_query(monkeypatch):
     assert data["answer"]
 
 
-def test_rag_answer():
+def test_rag_answer(monkeypatch):
+    monkeypatch.setattr(ai_router, "get_llm_from_config", lambda _db: object())
+    monkeypatch.setattr(ai_router, "get_embeddings_from_config", lambda _db: object())
+    monkeypatch.setattr(
+        ai_router,
+        "ask_document",
+        lambda *_args, **_kwargs: ("项目内部代号是萤火虫 8868。", ["guide.md"]),
+    )
+
     response = client.post(
         "/ai/rag",
         json={"question": "[TEST] AgentChat 项目的内部代号是什么？"},
@@ -245,6 +259,7 @@ def test_default_document_indexing_skips_existing_vectors(monkeypatch):
     indexed = []
 
     monkeypatch.setattr(rag, "default_documents_indexed", False)
+    monkeypatch.setattr(rag, "get_vector_store", lambda _embedding: object())
     monkeypatch.setattr(rag, "_vector_ids_exist", lambda _ids, **_kwargs: True)
     monkeypatch.setattr(
         rag,
@@ -322,7 +337,7 @@ def test_unified_assistant_stream_filters_tool_call_intermediate_output(monkeypa
     progress_messages = [event.progress for event in events if event.progress]
 
     assert deltas == ["武汉今天小雨转多云。"]
-    assert progress_messages == ["正在检索知识库..."]
+    assert progress_messages == ["正在检索知识库...", "工具调用完成"]
     assert events[-1].result is not None
     assert events[-1].result.answer == "武汉今天小雨转多云。"
 
@@ -398,3 +413,82 @@ def test_unified_assistant_stream_sanitizes_mcp_raw_payload(monkeypatch):
     assert "武汉今天小雨，气温偏高。" in streamed_text
     assert events[-1].result is not None
     assert events[-1].result.answer == "武汉今天小雨，气温偏高。"
+
+
+def test_unified_assistant_stream_sanitizes_knowledge_raw_payload(monkeypatch):
+    class FakeAgent:
+        async def astream(self, *_args, **_kwargs):
+            yield {
+                "type": "messages",
+                "data": (
+                    SimpleNamespace(
+                        type="ai",
+                        content='{"query":"毕博控股"}',
+                        tool_call_chunks=[{"name": "search_knowledge_base"}],
+                    ),
+                    {},
+                ),
+            }
+            yield {
+                "type": "values",
+                "data": {
+                    "messages": [
+                        SimpleNamespace(
+                            type="ai",
+                            content="",
+                            tool_calls=[{"name": "search_knowledge_base"}],
+                        ),
+                    ],
+                },
+            }
+            raw_answer = (
+                '调用完成\nsearch_knowledge_base\n'
+                '{"context":"简历内容片段","sources":["简历.pdf"]}\n'
+                '{"context":"重复的简历内容片段","sources":["简历.pdf"]}\n'
+                "知识库中没有找到毕博控股的相关信息。"
+            )
+            yield {
+                "type": "messages",
+                "data": (
+                    SimpleNamespace(type="ai", content=raw_answer),
+                    {},
+                ),
+            }
+            yield {
+                "type": "values",
+                "data": {
+                    "messages": [
+                        SimpleNamespace(
+                            type="ai",
+                            content="",
+                            tool_calls=[{"name": "search_knowledge_base"}],
+                        ),
+                        SimpleNamespace(type="ai", content=raw_answer),
+                    ],
+                },
+            }
+
+    monkeypatch.setattr(orchestrator, "create_unified_agent", lambda *_args, **_kwargs: FakeAgent())
+    monkeypatch.setattr(orchestrator, "create_task_tools", lambda **_kwargs: [])
+
+    async def collect_events():
+        events = []
+        async for event in orchestrator.stream_unified_assistant(
+            llm=object(),
+            model_input="毕博控股是什么",
+            embedding_function=object(),
+            mcp_tools=[],
+        ):
+            events.append(event)
+        return events
+
+    events = asyncio.run(collect_events())
+    streamed_text = "".join(event.delta or "" for event in events)
+
+    assert "search_knowledge_base" not in streamed_text
+    assert "调用完成" not in streamed_text
+    assert '"context"' not in streamed_text
+    assert '"sources"' not in streamed_text
+    assert "知识库中没有找到毕博控股的相关信息。" in streamed_text
+    assert events[-1].result is not None
+    assert events[-1].result.answer == "知识库中没有找到毕博控股的相关信息。"

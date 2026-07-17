@@ -1,5 +1,6 @@
 """ARQ worker entrypoint for AI task jobs."""
 
+import asyncio
 import logging
 import os
 
@@ -21,12 +22,27 @@ async def startup(ctx) -> None:
 
     try:
         await mcp_registry.refresh()
+        stop_event = asyncio.Event()
+        ctx["mcp_sync_stop"] = stop_event
+        ctx["mcp_sync_task"] = asyncio.create_task(
+            mcp_registry.watch_config_changes(stop_event=stop_event)
+        )
         logger.info("[task_worker] MCP registry refreshed on startup")
     except Exception:
         logger.exception("[task_worker] Failed to refresh MCP registry on startup")
 
 
 async def shutdown(ctx) -> None:
+    stop_event = ctx.get("mcp_sync_stop")
+    sync_task = ctx.get("mcp_sync_task")
+    if stop_event is not None:
+        stop_event.set()
+    if sync_task is not None:
+        sync_task.cancel()
+        try:
+            await sync_task
+        except asyncio.CancelledError:
+            pass
     try:
         await mcp_registry.close()
     except Exception:

@@ -361,6 +361,12 @@ def test_ai_auto_task_uses_email_from_prompt(monkeypatch):
     assert "邮件收件人：weather.owner@example.com" in task_input
 
 
+def test_extract_email_addresses_ignores_chinese_prefix():
+    assert task_executor._extract_email_addresses("发送邮箱给2810363752@qq.com") == [
+        "2810363752@qq.com",
+    ]
+
+
 def test_ai_auto_task_email_failure_does_not_fail_run(monkeypatch):
     """邮件发送失败不再判 run 失败，也不影响结果与后续调度。"""
 

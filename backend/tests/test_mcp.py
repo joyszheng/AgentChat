@@ -12,8 +12,17 @@ from mcp.server.transport_security import TransportSecuritySettings
 from app import models
 from app.database import SessionLocal
 from app.main import app
+from app import schemas
 from app.mcp import registry as registry_module
+from app.mcp.config import (
+    build_sse_config,
+    build_streamable_http_config,
+    normalize_server_namespace,
+    resolve_transport_config,
+    resolve_streamable_http_config,
+)
 from app.mcp.registry import MCPRegistry, RegisteredMCPTool, _qualified_tool_name, _wrap_tool
+from app.mcp.transports import build_mcp_connection
 from app.routers import ai as ai_router
 from app.routers import mcp as mcp_router
 from app.services.encryption import decrypt_value
@@ -31,6 +40,38 @@ def _source_tool() -> StructuredTool:
     )
 
 
+def _create_enabled_mcp_server(name: str) -> int:
+    with SessionLocal() as db:
+        existing = db.query(models.MCPServer).filter_by(name=name).one_or_none()
+        if existing is not None:
+            db.delete(existing)
+            db.commit()
+        server = models.MCPServer(
+            name=name,
+            namespace=normalize_server_namespace(name),
+            transport="streamable_http",
+            url="http://127.0.0.1:9999/mcp",
+            transport_config=build_streamable_http_config(
+                url="http://127.0.0.1:9999/mcp",
+                request_timeout_seconds=2,
+            ),
+            enabled=True,
+            allowed_tools=["*"],
+            call_timeout_seconds=2,
+        )
+        db.add(server)
+        db.commit()
+        return server.id
+
+
+def _delete_mcp_server(server_id: int) -> None:
+    with SessionLocal() as db:
+        server = db.get(models.MCPServer, server_id)
+        if server is not None:
+            db.delete(server)
+            db.commit()
+
+
 def _login_admin(client: TestClient) -> dict[str, str]:
     response = client.post(
         "/auth/login",
@@ -46,6 +87,77 @@ def test_qualified_tool_name_is_provider_safe_and_stable():
     long_name = _qualified_tool_name("server", "工具" * 100)
     assert len(long_name) <= 64
     assert long_name == _qualified_tool_name("server", "工具" * 100)
+
+
+def test_server_namespace_and_transport_config_are_stable_and_compatible():
+    assert normalize_server_namespace("Demo_Server") == "demo_server"
+    assert normalize_server_namespace("工具" * 100) == normalize_server_namespace("工具" * 100)
+
+    config = resolve_streamable_http_config(
+        transport_config={
+            "transport": "streamable_http",
+            "url": "https://mcp.example.com/mcp",
+            "request_timeout_seconds": 45,
+        },
+        legacy_transport="streamable_http",
+        legacy_url="https://legacy.example.com/mcp",
+        legacy_timeout_seconds=20,
+    )
+    assert config["url"] == "https://mcp.example.com/mcp"
+    assert config["request_timeout_seconds"] == 45
+    assert config["connect_timeout_seconds"] == 10
+
+
+def test_mcp_create_schema_accepts_discriminated_transport_config_without_legacy_url():
+    request = schemas.MCPServerCreate(
+        name="typed-config",
+        transport_config={
+            "transport": "streamable_http",
+            "url": "https://mcp.example.com/mcp",
+            "request_timeout_seconds": 30,
+        },
+    )
+    assert str(request.url) == "https://mcp.example.com/mcp"
+    assert request.transport_config is not None
+    assert request.transport_config.request_timeout_seconds == 30
+
+
+def test_sse_config_schema_and_adapter_connection():
+    request = schemas.MCPServerCreate(
+        name="sse-config",
+        transport_config={
+            "transport": "sse",
+            "url": "https://mcp.example.com/sse",
+            "request_timeout_seconds": 15,
+            "sse_read_timeout_seconds": 180,
+        },
+    )
+    assert request.transport == "sse"
+    assert request.transport_config is not None
+
+    config = resolve_transport_config(
+        transport_config=request.transport_config.model_dump(mode="json"),
+        legacy_transport="streamable_http",
+        legacy_url="https://legacy.example.com/mcp",
+        legacy_timeout_seconds=20,
+    )
+    connection = build_mcp_connection(
+        config,
+        headers={"Authorization": "Bearer secret"},
+    )
+
+    assert config == build_sse_config(
+        url="https://mcp.example.com/sse",
+        request_timeout_seconds=15,
+        sse_read_timeout_seconds=180,
+    )
+    assert connection == {
+        "transport": "sse",
+        "url": "https://mcp.example.com/sse",
+        "timeout": 15.0,
+        "sse_read_timeout": 180.0,
+        "headers": {"Authorization": "Bearer secret"},
+    }
 
 
 def test_wrapped_tool_enforces_namespace_and_result_limit():
@@ -178,6 +290,87 @@ def test_registry_refresh_marks_bad_server_config_unhealthy(monkeypatch):
                 db.commit()
 
 
+def test_reload_server_keeps_last_known_good_snapshot_when_refresh_fails(monkeypatch):
+    server_id = _create_enabled_mcp_server("last_known_good_mcp")
+    registry = MCPRegistry()
+    should_fail = False
+
+    async def fake_load_source_tools(_config):
+        if should_fail:
+            raise RuntimeError("temporary outage")
+        return SimpleNamespace(), [_source_tool()]
+
+    monkeypatch.setattr(registry, "_load_source_tools", fake_load_source_tools)
+
+    try:
+        assert asyncio.run(registry.reload_server(server_id)) is True
+        assert [tool.name for tool in registry.get_tools(is_admin=True)] == [
+            "last_known_good_mcp__echo"
+        ]
+
+        with SessionLocal() as db:
+            server = db.get(models.MCPServer, server_id)
+            assert server is not None
+            server.config_revision += 1
+            db.add(server)
+            db.commit()
+
+        should_fail = True
+        assert asyncio.run(registry.reload_server(server_id)) is False
+        assert [tool.name for tool in registry.get_tools(is_admin=True)] == [
+            "last_known_good_mcp__echo"
+        ]
+        with SessionLocal() as db:
+            server = db.get(models.MCPServer, server_id)
+            assert server is not None
+            assert server.catalog_status == "stale"
+            assert server.active_revision < server.config_revision
+
+        registry._stale_ttl_seconds = 0
+        asyncio.run(registry._expire_stale_snapshots())
+        assert registry.get_tools(is_admin=True) == []
+        with SessionLocal() as db:
+            server = db.get(models.MCPServer, server_id)
+            assert server is not None
+            assert server.catalog_status == "unhealthy"
+    finally:
+        _delete_mcp_server(server_id)
+
+
+def test_sync_if_changed_reloads_only_changed_server(monkeypatch):
+    first_id = _create_enabled_mcp_server("revision_first_mcp")
+    second_id = _create_enabled_mcp_server("revision_second_mcp")
+    registry = MCPRegistry()
+    loaded_ids: list[str] = []
+
+    async def fake_load_source_tools(config):
+        loaded_ids.append(config["name"])
+        return SimpleNamespace(), [_source_tool()]
+
+    monkeypatch.setattr(registry, "_load_source_tools", fake_load_source_tools)
+
+    try:
+        asyncio.run(registry.refresh())
+        loaded_ids.clear()
+        with SessionLocal() as db:
+            first = db.get(models.MCPServer, first_id)
+            assert first is not None
+            first.config_revision += 1
+            state = db.get(models.MCPConfigState, 1)
+            if state is None:
+                state = models.MCPConfigState(id=1, revision=1)
+            else:
+                state.revision += 1
+            db.add_all([first, state])
+            db.commit()
+
+        assert asyncio.run(registry.sync_if_changed()) is True
+        assert loaded_ids == ["revision_first_mcp"]
+    finally:
+        _delete_mcp_server(first_id)
+        _delete_mcp_server(second_id)
+
+
 def test_mcp_adapter_end_to_end_with_streamable_http_asgi():
     server = FastMCP(
         "AgentChat test MCP",
@@ -245,12 +438,31 @@ def test_mcp_server_crud_encrypts_headers_and_requires_admin():
         )
         assert response.status_code == 201
         data = response.json()
+        assert data["namespace"] == "test_mcp_server"
+        assert data["transport_config"]["transport"] == "streamable_http"
+        assert data["transport_config"]["url"] == "http://127.0.0.1:9999/mcp"
+        assert data["config_revision"] >= 1
         assert data["header_names"] == ["Authorization"]
         assert "top-secret" not in response.text
+
+        update_response = client.put(
+            f"/mcp/servers/{data['id']}",
+            headers=auth_headers,
+            json={
+                "transport": "sse",
+                "url": "http://127.0.0.1:9999/sse",
+            },
+        )
+        assert update_response.status_code == 200
+        updated = update_response.json()
+        assert updated["transport"] == "sse"
+        assert updated["transport_config"]["transport"] == "sse"
+        assert updated["transport_config"]["sse_read_timeout_seconds"] == 300
 
         with SessionLocal() as db:
             stored = db.get(models.MCPServer, data["id"])
             assert stored is not None
+            assert stored.transport == "sse"
             assert "top-secret" not in stored.headers_encrypted
             assert json.loads(decrypt_value(stored.headers_encrypted)) == {
                 "Authorization": "Bearer top-secret"
